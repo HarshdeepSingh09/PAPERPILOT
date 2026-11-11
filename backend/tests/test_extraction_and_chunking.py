@@ -17,7 +17,7 @@ from app.services.pdf_service import (
     CorruptedPDFError
 )
 from app.db.session import SessionLocal, init_db
-from app.db.models import Document, DocumentChunk
+from app.db.models import Document, DocumentChunk, LEGACY_OWNER_USER_ID
 from app.api.v1.documents import execute_extraction_and_chunking
 
 
@@ -198,6 +198,7 @@ class TestPDFExtractionAndChunking(unittest.TestCase):
         # Test execute_extraction_and_chunking sets ocr_required status
         db_doc = Document(
             id="doc-scanned-test",
+            user_id=LEGACY_OWNER_USER_ID,
             filename="scanned_doc.pdf",
             original_filename="Scanned Paper.pdf",
             file_path=path,
@@ -307,6 +308,7 @@ class TestPDFExtractionAndChunking(unittest.TestCase):
 
         doc_record = Document(
             id="doc-persist-test",
+            user_id=LEGACY_OWNER_USER_ID,
             filename="persist_test.pdf",
             original_filename="Persist Test.pdf",
             file_path=pdf_path,

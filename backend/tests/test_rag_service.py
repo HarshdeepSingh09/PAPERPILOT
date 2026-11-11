@@ -14,7 +14,7 @@ if BACKEND_DIR not in sys.path:
 
 from fastapi import HTTPException
 from app.db.session import SessionLocal, init_db
-from app.db.models import Document, DocumentChunk, ChatMessage
+from app.db.models import Document, DocumentChunk, ChatMessage, User, LEGACY_OWNER_USER_ID
 from app.schemas.chat import DocumentChatRequest, ChatRequest
 from app.services.vector_store import VectorStoreService
 from app.services.rag_service import (
@@ -82,6 +82,7 @@ class TestRAGService(unittest.TestCase):
 
         doc = Document(
             id=doc_id,
+            user_id=LEGACY_OWNER_USER_ID,
             filename=f"{doc_id}.pdf",
             original_filename="science_test.pdf",
             file_path=os.path.join(tempfile.gettempdir(), f"{doc_id}.pdf"),
@@ -464,9 +465,11 @@ class TestRAGEndpoints(unittest.TestCase):
 
     def setUp(self):
         self.db = SessionLocal()
+        self.owner = self.db.query(User).filter(User.id == LEGACY_OWNER_USER_ID).first()
         self.doc_id = str(uuid.uuid4())
         self.doc = Document(
             id=self.doc_id,
+            user_id=self.owner.id,
             filename=f"{self.doc_id}.pdf",
             original_filename="api_chat_doc.pdf",
             file_path=os.path.join(tempfile.gettempdir(), f"{self.doc_id}.pdf"),
@@ -515,6 +518,7 @@ class TestRAGEndpoints(unittest.TestCase):
                 resp = chat_with_document(
                     self.doc_id,
                     DocumentChatRequest(message="Tell me about chemistry", top_k=2),
+                    current_user=self.owner,
                     db=self.db
                 )
 
@@ -531,7 +535,7 @@ class TestRAGEndpoints(unittest.TestCase):
         self.db.add_all([msg1, msg2])
         self.db.commit()
 
-        history = get_document_chat_history(self.doc_id, db=self.db)
+        history = get_document_chat_history(self.doc_id, current_user=self.owner, db=self.db)
         self.assertEqual(len(history), 2)
         self.assertEqual(history[0].role, "user")
         self.assertEqual(history[1].role, "assistant")
@@ -542,12 +546,12 @@ class TestRAGEndpoints(unittest.TestCase):
         self.db.add(msg)
         self.db.commit()
 
-        resp = clear_document_chat_history(self.doc_id, db=self.db)
+        resp = clear_document_chat_history(self.doc_id, current_user=self.owner, db=self.db)
         self.assertEqual(resp.document_id, self.doc_id)
         self.assertEqual(resp.deleted_count, 1)
 
         # Confirm history is now empty
-        history = get_document_chat_history(self.doc_id, db=self.db)
+        history = get_document_chat_history(self.doc_id, current_user=self.owner, db=self.db)
         self.assertEqual(len(history), 0)
 
     # 15. Endpoint: POST /chat (Legacy route support)
@@ -559,6 +563,7 @@ class TestRAGEndpoints(unittest.TestCase):
             with patch("app.services.rag_service.rag_service.generate_answer", return_value=mock_answer):
                 resp = send_chat_message(
                     ChatRequest(document_id=self.doc_id, message="Hello via legacy route"),
+                    current_user=self.owner,
                     db=self.db
                 )
 
@@ -570,6 +575,7 @@ class TestRAGEndpoints(unittest.TestCase):
             chat_with_document(
                 "non-existent-uuid",
                 DocumentChatRequest(message="test"),
+                current_user=self.owner,
                 db=self.db
             )
         self.assertEqual(ctx.exception.status_code, 404)

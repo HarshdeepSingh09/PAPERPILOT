@@ -1,6 +1,8 @@
 import os
+import re
 import json
 import uuid
+import shutil
 import logging
 from typing import List, Optional
 import pymupdf
@@ -9,8 +11,9 @@ from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.deps import get_current_user, get_owned_document
 from app.db.session import get_db, SessionLocal
-from app.db.models import Document, DocumentChunk
+from app.db.models import Document, DocumentChunk, User
 from app.schemas.document import (
     DocumentResponse,
     DocumentStatsResponse,
@@ -21,13 +24,24 @@ from app.schemas.document import (
     SearchRequest,
     SearchResponse,
     SearchResultItem,
-    ChunkResponse
+    ChunkResponse,
+    DocumentContentResponse,
+    DocumentContentSection,
 )
+from app.schemas.insights import CategoryUpdateRequest
 from app.services.pdf_service import (
     pdf_service,
     PasswordProtectedPDFError,
     CorruptedPDFError,
     PDFExtractionError
+)
+from app.services.document_extractor import (
+    document_extractor,
+    DocumentValidationError,
+)
+from app.services.classification_service import (
+    classification_service,
+    DOCUMENT_CATEGORIES,
 )
 from app.services.chunking_service import default_chunker, TextChunk
 from app.services.embedding_service import (
@@ -63,17 +77,82 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+def _sanitize_storage_filename(raw_name: Optional[str], file_format: str) -> str:
+    """Normalizes a user-supplied filename into a safe single path component."""
+    base = os.path.basename((raw_name or "").replace("\\", "/")).strip()
+    safe = re.sub(r"[^A-Za-z0-9._\-]+", "_", base).strip("._")
+    if not safe:
+        safe = f"document.{file_format}"
+    elif not safe.lower().endswith(f".{file_format}"):
+        safe = f"{safe}.{file_format}"
+    return safe[:160]
+
+
+def _build_user_document_storage_path(
+    user_id: str,
+    doc_id: str,
+    original_filename: Optional[str],
+    file_format: str,
+) -> tuple[str, str]:
+    """
+    Constructs isolated per-user, per-document storage paths:
+    storage/uploads/{user_id}/{document_id}/{safe_original_filename}
+    Validates strict containment inside settings.UPLOAD_DIR.
+    """
+    upload_root = os.path.abspath(settings.UPLOAD_DIR)
+    safe_user = re.sub(r"[^A-Za-z0-9\-_]", "", str(user_id))
+    safe_doc = re.sub(r"[^A-Za-z0-9\-_]", "", str(doc_id))
+    if not safe_user or not safe_doc:
+        raise ValueError("Invalid user or document storage identifier.")
+
+    safe_filename = _sanitize_storage_filename(original_filename, file_format)
+    doc_dir = os.path.abspath(os.path.join(upload_root, safe_user, safe_doc))
+    full_path = os.path.abspath(os.path.join(doc_dir, safe_filename))
+
+    if os.path.commonpath([upload_root, full_path]) != upload_root:
+        raise ValueError("Resolved storage path escapes configured upload root.")
+
+    os.makedirs(doc_dir, exist_ok=True)
+    return safe_filename, full_path
+
+
+def _resolve_safe_document_file_path(doc: Document) -> Optional[str]:
+    """
+    Resolves a document's path strictly inside UPLOAD_DIR without exposing internal path traversal.
+    Supports both isolated per-user paths (storage/uploads/{user_id}/{doc_id}/...) and legacy flat paths.
+    """
+    upload_root = os.path.abspath(settings.UPLOAD_DIR)
+    candidates = []
+    if doc.file_path:
+        raw_fp = doc.file_path if os.path.isabs(doc.file_path) else os.path.join(upload_root, doc.file_path)
+        candidates.append(os.path.abspath(raw_fp))
+    if doc.user_id and doc.id and doc.filename:
+        candidates.append(os.path.abspath(os.path.join(upload_root, str(doc.user_id), str(doc.id), os.path.basename(doc.filename))))
+    if doc.filename:
+        candidates.append(os.path.abspath(os.path.join(upload_root, os.path.basename(doc.filename))))
+
+    for cand in candidates:
+        try:
+            if os.path.commonpath([upload_root, cand]) == upload_root and os.path.isfile(cand):
+                return cand
+        except ValueError:
+            continue
+    return None
+
+
 def execute_extraction_and_chunking(doc: Document, db: Session, next_status: str = "ready") -> Document:
     """
-    Extracts text, cleans it, checks for scanned/image-only PDFs, generates chunks,
-    and updates database records idempotently (clearing any existing chunks).
+    Extracts text from PDF/DOCX/TXT, cleans it, checks for scanned/image-only PDFs,
+    runs intelligent document classification, generates chunks, and updates SQLite idempotently.
     """
     # 1. Clean existing chunks to prevent duplicates
     db.query(DocumentChunk).filter(DocumentChunk.document_id == doc.id).delete()
 
-    # 2. Extract and inspect text
-    extraction = pdf_service.inspect_and_extract(doc.file_path)
+    # 2. Extract and inspect text across supported formats
+    doc_format = (getattr(doc, "file_format", None) or os.path.splitext(doc.file_path)[1].lstrip(".") or "pdf").lower()
+    extraction = document_extractor.inspect_and_extract(doc.file_path, doc_format)
 
+    doc.file_format = extraction.get("file_format", doc_format)
     doc.total_pages = extraction["total_pages"]
     doc.extracted_pages = extraction["extracted_pages"]
     doc.total_characters = extraction["total_characters"]
@@ -85,34 +164,62 @@ def execute_extraction_and_chunking(doc: Document, db: Session, next_status: str
     doc.subject = doc_struct.get("subject")
     doc.doc_metadata_json = json.dumps(doc_struct) if doc_struct else None
 
-    # 3. Check for scanned / image-only PDFs
+    # 3. Check for scanned / image-only PDFs or empty documents
     if extraction["is_scanned"]:
-        doc.status = "ocr_required"
-        doc.error_message = (
-            "No extractable text found. The document appears to be a scanned image or empty. "
-            "OCR is not yet supported."
-        )
+        if doc.file_format == "pdf":
+            doc.status = "ocr_required"
+            doc.error_message = (
+                "No extractable text found. The document appears to be a scanned image or empty. "
+                "OCR is not yet supported."
+            )
+        else:
+            doc.status = "failed"
+            doc.error_message = "No readable text could be extracted from the uploaded file."
         doc.total_chunks = 0
         doc.embedding_status = "failed"
         db.commit()
         db.refresh(doc)
         return doc
 
-    # 4. Chunk document content
+    # 4. Intelligent classification (skip overwriting if user already manually set category)
+    if getattr(doc, "classification_source", None) != "manual":
+        sample_parts = [p["text"] for p in extraction["pages"][:6] if p.get("text")]
+        if len(extraction["pages"]) > 6:
+            sample_parts.append(extraction["pages"][-1].get("text", ""))
+        text_sample = "\n\n".join(sample_parts)[:6500]
+        raw_headings = [h["text"] for h in extraction.get("headings", []) if isinstance(h, dict) and h.get("text")]
+        if not raw_headings and isinstance(doc_struct.get("headings"), list):
+            raw_headings = doc_struct.get("headings", [])
+
+        cls_res = classification_service.classify_document(
+            text_sample=text_sample,
+            doc_metadata=doc_struct,
+            headings=raw_headings,
+            use_ai=True,
+        )
+        doc.document_category = cls_res["category"]
+        doc.classification_confidence = cls_res["confidence"]
+        doc.classification_source = cls_res["source"]
+        doc.classification_reason = cls_res["reason"]
+
+    # 5. Chunk document content
     chunks: List[TextChunk] = default_chunker.chunk_document(doc.id, extraction["pages"])
 
-    # 5. Persist chunk records
+    # 6. Persist chunk records with owner user_id
     db_chunks = []
     for c in chunks:
         db_chunk = DocumentChunk(
             id=c.id,
             document_id=doc.id,
+            user_id=doc.user_id,
             chunk_index=c.chunk_index,
             content=c.content,
             char_count=c.char_count,
             page_start=c.page_start,
             page_end=c.page_end,
             pages_json=json.dumps(c.pages),
+            section_title=c.section_title,
+            paragraph_range=c.paragraph_range,
         )
         db_chunks.append(db_chunk)
 
@@ -181,7 +288,7 @@ def process_document_pipeline(document_id: str, db: Optional[Session] = None) ->
         db.commit()
         db.refresh(doc)
 
-        vector_store_service.index_document_chunks(document_id=doc.id, db=db, force=False)
+        vector_store_service.index_document_chunks(document_id=doc.id, db=db, force=False, user_id=doc.user_id)
 
         # Step 4: Ready
         doc.status = "ready"
@@ -212,11 +319,12 @@ def process_document_pipeline(document_id: str, db: Optional[Session] = None) ->
 
 def ensure_document_metadata(doc: Document, db: Session) -> Document:
     """
-    Backfills document title and chapter metadata if not yet extracted.
+    Backfills document metadata if not yet extracted.
     """
+    doc_fmt = (getattr(doc, "file_format", None) or "pdf").lower()
     if doc.title is None and doc.file_path and os.path.exists(doc.file_path) and doc.status != "ocr_required":
         try:
-            extraction = pdf_service.inspect_and_extract(doc.file_path)
+            extraction = document_extractor.inspect_and_extract(doc.file_path, doc_fmt)
             doc_struct = extraction.get("document_metadata", {})
             if doc_struct:
                 doc.title = doc_struct.get("title")
@@ -236,62 +344,90 @@ async def upload_document(
     file: UploadFile = File(...),
     background: bool = Query(True, description="Whether to run pipeline in background or synchronously"),
     background_tasks: BackgroundTasks = None,
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """
-    Upload a PDF document and immediately execute the automatic processing pipeline:
-    extract text, clean, chunk, extract metadata, generate Gemini embeddings,
-    and index vectors into ChromaDB.
+    Upload a PDF, DOCX, or TXT document into the authenticated user's isolated storage directory
+    and execute the automatic processing pipeline: extract text, classify category, clean, chunk,
+    extract metadata, generate Gemini embeddings, and index vectors into ChromaDB tagged with user_id.
     """
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Only PDF documents are supported."
+    try:
+        file_format = document_extractor.validate_extension_and_mime(
+            file.filename or "",
+            file.content_type,
         )
+    except DocumentValidationError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
 
     doc_id = str(uuid.uuid4())
-    stored_filename = f"{doc_id}.pdf"
-    file_path = os.path.abspath(os.path.join(settings.UPLOAD_DIR, stored_filename))
-
-    # Save uploaded file to disk
-    file_size = 0
-    with open(file_path, "wb") as buffer:
-        while content := await file.read(1024 * 1024):  # 1MB chunks
-            file_size += len(content)
-            buffer.write(content)
-
-    # Validate PDF structure and encryption upfront
     try:
-        check_doc = pymupdf.open(file_path)
-        if check_doc.is_encrypted:
-            check_doc.close()
-            if os.path.exists(file_path):
-                os.remove(file_path)
-            raise PasswordProtectedPDFError("The PDF document is password-protected. Please upload an unprotected PDF.")
-        check_doc.close()
-    except PasswordProtectedPDFError as e:
+        stored_filename, file_path = _build_user_document_storage_path(
+            user_id=current_user.id,
+            doc_id=doc_id,
+            original_filename=file.filename,
+            file_format=file_format,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    max_bytes = settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024
+
+    # Save uploaded file to disk inside user-isolated folder while enforcing size limit
+    file_size = 0
+    try:
+        with open(file_path, "wb") as buffer:
+            while content := await file.read(1024 * 1024):  # 1MB chunks
+                file_size += len(content)
+                if file_size > max_bytes:
+                    raise ValueError(
+                        f"File exceeds maximum allowed upload limit of {settings.MAX_UPLOAD_SIZE_MB} MB."
+                    )
+                buffer.write(content)
+    except ValueError as e:
         if os.path.exists(file_path):
             os.remove(file_path)
+        shutil.rmtree(os.path.dirname(file_path), ignore_errors=True)
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(e)
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=str(e),
         )
+
+    # Validate file integrity, non-empty content, and non-encryption upfront
+    try:
+        document_extractor.validate_saved_file(
+            file_path=file_path,
+            file_format=file_format,
+            file_size=file_size,
+            max_size_bytes=max_bytes,
+        )
+    except DocumentValidationError as e:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        shutil.rmtree(os.path.dirname(file_path), ignore_errors=True)
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except Exception as e:
         if os.path.exists(file_path):
             os.remove(file_path)
+        shutil.rmtree(os.path.dirname(file_path), ignore_errors=True)
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"The uploaded file is corrupted or not a valid PDF: {str(e)}"
+            detail="The uploaded file could not be validated.",
         )
 
-    # Initial Document record in 'uploaded' status
+    # Initial Document record bound strictly to authenticated current_user.id
     new_doc = Document(
         id=doc_id,
+        user_id=current_user.id,
         filename=stored_filename,
-        original_filename=file.filename,
+        original_filename=os.path.basename((file.filename or stored_filename).replace("\\", "/")),
         file_path=file_path,
         file_size_bytes=file_size,
         total_pages=0,
+        file_format=file_format,
+        document_category="General Document",
+        classification_confidence=0.0,
+        classification_source="auto",
         status="uploaded",
         embedding_status="pending"
     )
@@ -307,51 +443,168 @@ async def upload_document(
         return processed_doc or new_doc
 
 
+@router.get("/categories", response_model=List[str])
+def list_document_categories(current_user: User = Depends(get_current_user)):
+    """
+    List all supported document categories for classification and manual override.
+    """
+    return DOCUMENT_CATEGORIES
+
+
 @router.get("", response_model=List[DocumentResponse])
-def list_documents(db: Session = Depends(get_db)):
+def list_documents(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     """
-    List all uploaded documents ordered by creation time descending.
+    List all uploaded documents belonging strictly to the authenticated user.
     """
-    return db.query(Document).order_by(Document.created_at.desc()).all()
+    return (
+        db.query(Document)
+        .filter(Document.user_id == current_user.id)
+        .order_by(Document.created_at.desc())
+        .all()
+    )
+
+
+@router.patch("/{document_id}/category", response_model=DocumentResponse)
+def update_document_category(
+    document_id: str,
+    payload: CategoryUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Allow users to manually override the detected document category for their own document.
+    """
+    doc = get_owned_document(document_id, current_user, db)
+
+    if payload.category not in DOCUMENT_CATEGORIES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid category '{payload.category}'. Allowed: {', '.join(DOCUMENT_CATEGORIES)}"
+        )
+
+    doc.document_category = payload.category
+    doc.classification_confidence = 1.0
+    doc.classification_source = "manual"
+    doc.classification_reason = "Manually selected by user"
+    db.commit()
+    db.refresh(doc)
+    return doc
+
+
+@router.get("/{document_id}/content", response_model=DocumentContentResponse)
+def get_document_content(
+    document_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Return structured extracted sections/pages for reading DOCX, TXT, or PDF content in-browser.
+    """
+    doc = get_owned_document(document_id, current_user, db)
+
+    doc_fmt = (getattr(doc, "file_format", None) or "pdf").lower()
+    citation_unit = "page" if doc_fmt == "pdf" else "section"
+
+    if doc.file_path and os.path.exists(doc.file_path) and doc.status not in ("ocr_required", "failed"):
+        try:
+            extraction = document_extractor.inspect_and_extract(doc.file_path, doc_fmt)
+            sections = [
+                DocumentContentSection(
+                    section_index=int(p.get("section_index") or p.get("page") or idx + 1),
+                    section_title=p.get("section_title") or (f"Page {p.get('page', idx + 1)}" if doc_fmt == "pdf" else f"Section {idx + 1}"),
+                    paragraph_start=p.get("paragraph_start"),
+                    paragraph_end=p.get("paragraph_end"),
+                    content=p.get("text") or "",
+                    char_count=p.get("char_count") or len(p.get("text") or ""),
+                )
+                for idx, p in enumerate(extraction.get("pages", []))
+                if p.get("text")
+            ]
+            return DocumentContentResponse(
+                document_id=doc.id,
+                original_filename=doc.original_filename,
+                file_format=doc_fmt,
+                citation_unit=citation_unit,
+                total_sections=len(sections),
+                headings=extraction.get("headings", []),
+                sections=sections,
+            )
+        except Exception:
+            pass
+
+    # Fallback to persisted SQLite chunks
+    chunks = (
+        db.query(DocumentChunk)
+        .filter(DocumentChunk.document_id == document_id)
+        .order_by(DocumentChunk.chunk_index.asc())
+        .all()
+    )
+    sections = [
+        DocumentContentSection(
+            section_index=c.page_start,
+            section_title=getattr(c, "section_title", None) or (f"Page {c.page_start}" if doc_fmt == "pdf" else f"Section {c.page_start}"),
+            content=c.content,
+            char_count=c.char_count,
+        )
+        for c in chunks
+    ]
+    return DocumentContentResponse(
+        document_id=doc.id,
+        original_filename=doc.original_filename,
+        file_format=doc_fmt,
+        citation_unit=citation_unit,
+        total_sections=len(sections),
+        headings=[],
+        sections=sections,
+    )
 
 
 @router.get("/{document_id}", response_model=DocumentResponse)
-def get_document(document_id: str, db: Session = Depends(get_db)):
+def get_document(
+    document_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     """
-    Retrieve document details, extraction status, and chunk counts by ID.
+    Retrieve document details, extraction status, and chunk counts by ID for the authenticated owner.
     """
-    doc = db.query(Document).filter(Document.id == document_id).first()
-    if not doc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+    doc = get_owned_document(document_id, current_user, db)
     ensure_document_metadata(doc, db)
     return doc
 
 
 @router.get("/{document_id}/stats", response_model=DocumentStatsResponse)
-def get_document_stats(document_id: str, db: Session = Depends(get_db)):
+def get_document_stats(
+    document_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     """
-    Retrieve detailed extraction statistics and page analysis for a document.
+    Retrieve detailed extraction statistics and page analysis for an owned document.
     """
-    doc = db.query(Document).filter(Document.id == document_id).first()
-    if not doc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+    doc = get_owned_document(document_id, current_user, db)
     ensure_document_metadata(doc, db)
 
     avg_chunk_size = 0.0
     if doc.total_chunks > 0 and doc.total_characters > 0:
         avg_chunk_size = round(doc.total_characters / doc.total_chunks, 1)
 
-    # Optional detailed page char count inspection
+    # Optional detailed page/section char count inspection
     page_breakdown = None
+    doc_fmt = (getattr(doc, "file_format", None) or "pdf").lower()
     if os.path.exists(doc.file_path) and doc.status != "failed":
         try:
-            extraction = pdf_service.inspect_and_extract(doc.file_path)
+            extraction = document_extractor.inspect_and_extract(doc.file_path, doc_fmt)
             page_breakdown = [
                 {
                     "page": p["page"],
                     "char_count": p["char_count"],
                     "is_empty": p["is_empty"],
-                    "has_images": p["has_images"]
+                    "has_images": p.get("has_images", False),
+                    "section_title": p.get("section_title"),
                 }
                 for p in extraction["pages"]
             ]
@@ -372,6 +625,12 @@ def get_document_stats(document_id: str, db: Session = Depends(get_db)):
         chapter_name=doc.chapter_name,
         chapter_number=doc.chapter_number,
         subject=doc.subject,
+        file_format=doc_fmt,
+        document_category=getattr(doc, "document_category", "General Document") or "General Document",
+        classification_confidence=getattr(doc, "classification_confidence", 0.0) or 0.0,
+        classification_source=getattr(doc, "classification_source", "auto"),
+        classification_reason=getattr(doc, "classification_reason", None),
+        citation_unit="page" if doc_fmt == "pdf" else "section",
         error_message=doc.error_message,
         average_chunk_size=avg_chunk_size,
         page_breakdown=page_breakdown
@@ -384,14 +643,13 @@ def get_document_chunks(
     document_id: str,
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=500),
-    db: Session = Depends(get_db)
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     """
-    Inspect chunk metadata, page ranges, and content for debugging and verification.
+    Inspect chunk metadata, page ranges, and content for an owned document.
     """
-    doc = db.query(Document).filter(Document.id == document_id).first()
-    if not doc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+    get_owned_document(document_id, current_user, db)
 
     total_chunks = db.query(DocumentChunk).filter(DocumentChunk.document_id == document_id).count()
     chunks = (
@@ -412,6 +670,8 @@ def get_document_chunks(
             page_end=c.page_end,
             pages=c.pages,
             content=c.content,
+            section_title=getattr(c, "section_title", None),
+            paragraph_range=getattr(c, "paragraph_range", None),
             embedding_dimension=c.embedding_dimension,
             created_at=c.created_at
         )
@@ -429,15 +689,14 @@ def get_document_chunks(
 def generate_document_embeddings(
     document_id: str,
     force: bool = Query(False, description="Whether to regenerate embeddings if they already exist"),
-    db: Session = Depends(get_db)
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     """
-    Generate Gemini semantic embeddings for all document chunks.
+    Generate Gemini semantic embeddings for all owned document chunks.
     Avoids regenerating if valid embeddings already exist unless force=True.
     """
-    doc = db.query(Document).filter(Document.id == document_id).first()
-    if not doc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+    doc = get_owned_document(document_id, current_user, db)
 
     if doc.status == "ocr_required":
         raise HTTPException(
@@ -491,14 +750,13 @@ def generate_document_embeddings(
 @router.get("/{document_id}/embeddings", response_model=DocumentEmbeddingStatusResponse)
 def get_document_embedding_status(
     document_id: str,
-    db: Session = Depends(get_db)
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     """
-    Retrieve embedding status, model name, and dimensions for a document.
+    Retrieve embedding status, model name, and dimensions for an owned document.
     """
-    doc = db.query(Document).filter(Document.id == document_id).first()
-    if not doc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+    doc = get_owned_document(document_id, current_user, db)
 
     chunks = (
         db.query(DocumentChunk)
@@ -530,17 +788,18 @@ def reprocess_document(
     document_id: str,
     background: bool = Query(True, description="Whether to run pipeline in background"),
     background_tasks: BackgroundTasks = None,
-    db: Session = Depends(get_db)
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     """
-    Re-runs the complete automatic processing pipeline on an existing document.
+    Re-runs the complete automatic processing pipeline on an ownership-verified document.
     """
-    doc = db.query(Document).filter(Document.id == document_id).first()
-    if not doc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+    doc = get_owned_document(document_id, current_user, db)
 
-    if not os.path.exists(doc.file_path):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="PDF file not found on disk")
+    resolved_path = _resolve_safe_document_file_path(doc)
+    if not resolved_path:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Stored file not found")
+    doc.file_path = resolved_path
 
     doc.status = "uploaded"
     doc.error_message = None
@@ -556,33 +815,37 @@ def reprocess_document(
 
 
 @router.get("/{document_id}/file")
-def get_document_file(document_id: str, db: Session = Depends(get_db)):
+def get_document_file(
+    document_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     """
-    Stream the raw PDF file for rendering in the frontend PDF viewer with inline disposition.
+    Stream the raw file for an ownership-verified document with inline disposition.
+    Never exposes internal filesystem paths.
     """
-    doc = db.query(Document).filter(Document.id == document_id).first()
-    if not doc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+    doc = get_owned_document(document_id, current_user, db)
 
-    file_path = doc.file_path
-    if not os.path.isabs(file_path):
-        file_path = os.path.abspath(os.path.join(settings.UPLOAD_DIR, doc.filename))
+    file_path = _resolve_safe_document_file_path(doc)
+    if not file_path:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Stored file not found")
 
-    if not os.path.exists(file_path):
-        fallback = os.path.abspath(os.path.join(settings.UPLOAD_DIR, doc.filename))
-        if os.path.exists(fallback):
-            file_path = fallback
-        else:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="PDF file not found on disk")
+    doc_fmt = (getattr(doc, "file_format", None) or "pdf").lower()
+    media_map = {
+        "pdf": "application/pdf",
+        "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "txt": "text/plain; charset=utf-8",
+    }
 
+    safe_disp_name = os.path.basename((doc.original_filename or "document").replace('"', "").replace("\r", "").replace("\n", ""))
     return FileResponse(
         path=file_path,
-        media_type="application/pdf",
-        filename=doc.original_filename,
+        media_type=media_map.get(doc_fmt, "application/octet-stream"),
+        filename=safe_disp_name,
         content_disposition_type="inline",
         headers={
             "Accept-Ranges": "bytes",
-            "Content-Disposition": f'inline; filename="{doc.original_filename}"',
+            "Content-Disposition": f'inline; filename="{safe_disp_name}"',
             "Access-Control-Expose-Headers": "Content-Disposition, Content-Range, Accept-Ranges"
         }
     )
@@ -592,18 +855,21 @@ def get_document_file(document_id: str, db: Session = Depends(get_db)):
 def index_document_vectors(
     document_id: str,
     force: bool = Query(False, description="Whether to force re-indexing even if already indexed"),
-    db: Session = Depends(get_db)
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     """
-    Ingest existing embeddings from SQLite for the given document into ChromaDB.
-    Avoids regenerating embeddings and guarantees zero duplicate vectors.
+    Ingest existing embeddings from SQLite for an owned document into ChromaDB.
     """
-    doc = db.query(Document).filter(Document.id == document_id).first()
-    if not doc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+    doc = get_owned_document(document_id, current_user, db)
 
     try:
-        result = vector_store_service.index_document_chunks(document_id=doc.id, db=db, force=force)
+        result = vector_store_service.index_document_chunks(
+            document_id=doc.id,
+            db=db,
+            force=force,
+            user_id=current_user.id,
+        )
         return DocumentIndexResponse(**result)
     except DocumentNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -621,17 +887,20 @@ def index_document_vectors(
 @router.get("/{document_id}/index-status", response_model=DocumentIndexStatusResponse)
 def get_document_index_status(
     document_id: str,
-    db: Session = Depends(get_db)
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     """
-    Inspect ChromaDB vector indexing status, vector counts, and collection details for a document.
+    Inspect ChromaDB vector indexing status for an owned document.
     """
-    doc = db.query(Document).filter(Document.id == document_id).first()
-    if not doc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+    doc = get_owned_document(document_id, current_user, db)
 
     try:
-        status_info = vector_store_service.get_indexing_status(document_id=doc.id, db=db)
+        status_info = vector_store_service.get_indexing_status(
+            document_id=doc.id,
+            db=db,
+            user_id=current_user.id,
+        )
         return DocumentIndexStatusResponse(**status_info)
     except Exception as e:
         raise HTTPException(
@@ -644,15 +913,13 @@ def get_document_index_status(
 def search_document_chunks(
     document_id: str,
     request: SearchRequest,
-    db: Session = Depends(get_db)
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     """
-    Perform semantic similarity search on a document's chunks using ChromaDB.
-    Generates a query embedding, queries ChromaDB, and returns ranked chunks with page citations.
+    Perform ownership-verified semantic similarity search on an owned document's chunks using ChromaDB.
     """
-    doc = db.query(Document).filter(Document.id == document_id).first()
-    if not doc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+    doc = get_owned_document(document_id, current_user, db)
 
     if doc.status != "ready":
         if doc.status == "ocr_required":
@@ -666,7 +933,8 @@ def search_document_chunks(
             document_id=doc.id,
             query=request.query,
             top_k=request.top_k,
-            db=db
+            db=db,
+            user_id=current_user.id,
         )
         return SearchResponse(
             document_id=doc.id,
@@ -697,19 +965,20 @@ def search_document_chunks(
 def chat_with_document(
     document_id: str,
     request: DocumentChatRequest,
-    db: Session = Depends(get_db)
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     """
-    Perform grounded Retrieval-Augmented Generation (RAG) chat against a document.
-    Retrieves semantic excerpts, generates answers with Gemini, persists conversation,
-    and returns verified page citations.
+    Perform grounded Retrieval-Augmented Generation (RAG) chat against an ownership-verified document.
     """
+    get_owned_document(document_id, current_user, db)
     try:
         result = rag_service.answer_document_query(
             document_id=document_id,
             query=request.message,
             db=db,
-            top_k=request.top_k
+            top_k=request.top_k,
+            user_id=current_user.id,
         )
         return ChatResponse(**result)
     except (DocumentNotFoundError, RAGDocNotFoundError) as e:
@@ -736,13 +1005,15 @@ def chat_with_document(
 @router.get("/{document_id}/chat/history", response_model=List[MessageHistoryItem])
 def get_document_chat_history(
     document_id: str,
-    db: Session = Depends(get_db)
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     """
-    Retrieve all conversation messages and citations for a document in chronological order.
+    Retrieve all conversation messages and citations for an ownership-verified document.
     """
+    get_owned_document(document_id, current_user, db)
     try:
-        history = rag_service.get_history(document_id=document_id, db=db)
+        history = rag_service.get_history(document_id=document_id, db=db, user_id=current_user.id)
         return [MessageHistoryItem(**item) for item in history]
     except (DocumentNotFoundError, RAGDocNotFoundError) as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -756,13 +1027,15 @@ def get_document_chat_history(
 @router.delete("/{document_id}/chat/history", response_model=ClearHistoryResponse)
 def clear_document_chat_history(
     document_id: str,
-    db: Session = Depends(get_db)
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     """
-    Delete all conversation messages for a document.
+    Delete all conversation messages for an ownership-verified document.
     """
+    get_owned_document(document_id, current_user, db)
     try:
-        deleted = rag_service.clear_history(document_id=document_id, db=db)
+        deleted = rag_service.clear_history(document_id=document_id, db=db, user_id=current_user.id)
         return ClearHistoryResponse(
             document_id=document_id,
             deleted_count=deleted,
@@ -778,25 +1051,32 @@ def clear_document_chat_history(
 
 
 @router.delete("/{document_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_document(document_id: str, db: Session = Depends(get_db)):
+def delete_document(
+    document_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     """
-    Delete a document, its stored PDF file, its chunks (cascade), and ChromaDB vectors.
+    Delete an ownership-verified document, its stored file and isolated folder, chunks, and ChromaDB vectors.
     """
-    doc = db.query(Document).filter(Document.id == document_id).first()
-    if not doc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+    doc = get_owned_document(document_id, current_user, db)
 
-    # Clean up vectors from ChromaDB
+    # Clean up vectors from ChromaDB scoped by user & document
     try:
-        vector_store_service.delete_document_vectors(document_id)
+        vector_store_service.delete_document_vectors(document_id, user_id=current_user.id)
     except Exception:
         pass
 
-    if os.path.exists(doc.file_path):
+    resolved_path = _resolve_safe_document_file_path(doc)
+    upload_root = os.path.abspath(settings.UPLOAD_DIR)
+    user_doc_dir = os.path.abspath(os.path.join(upload_root, str(current_user.id), str(doc.id)))
+    if resolved_path and os.path.exists(resolved_path):
         try:
-            os.remove(doc.file_path)
+            os.remove(resolved_path)
         except OSError:
             pass
+    if os.path.commonpath([upload_root, user_doc_dir]) == upload_root and os.path.isdir(user_doc_dir):
+        shutil.rmtree(user_doc_dir, ignore_errors=True)
 
     db.delete(doc)
     db.commit()

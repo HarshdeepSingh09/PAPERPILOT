@@ -43,15 +43,14 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Set all CORS enabled origins
+# Configure explicit allowed origins with credentials enabled for HttpOnly cookie auth
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
-    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["Content-Disposition", "Content-Range", "Accept-Ranges", "Content-Length", "*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "Accept"],
+    expose_headers=["Content-Disposition", "Content-Range", "Accept-Ranges", "Content-Length"],
 )
 
 # Include API v1 router

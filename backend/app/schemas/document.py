@@ -26,6 +26,12 @@ class DocumentResponse(DocumentBase):
     chapter_name: Optional[str] = None
     chapter_number: Optional[str] = None
     subject: Optional[str] = None
+    file_format: str = "pdf"
+    document_category: str = "General Document"
+    classification_confidence: float = 0.0
+    classification_source: Optional[str] = "auto"
+    classification_reason: Optional[str] = None
+    citation_unit: str = "page"
     error_message: Optional[str] = None
     created_at: datetime
     updated_at: datetime
@@ -42,6 +48,8 @@ class ChunkResponse(BaseModel):
     page_end: int
     pages: List[int]
     content: str
+    section_title: Optional[str] = None
+    paragraph_range: Optional[str] = None
     embedding_dimension: Optional[int] = None
     created_at: Optional[datetime] = None
 
@@ -69,6 +77,12 @@ class DocumentStatsResponse(BaseModel):
     chapter_name: Optional[str] = None
     chapter_number: Optional[str] = None
     subject: Optional[str] = None
+    file_format: str = "pdf"
+    document_category: str = "General Document"
+    classification_confidence: float = 0.0
+    classification_source: Optional[str] = "auto"
+    classification_reason: Optional[str] = None
+    citation_unit: str = "page"
     error_message: Optional[str] = None
     average_chunk_size: float = 0.0
     page_breakdown: Optional[List[Dict[str, Any]]] = None
@@ -115,6 +129,8 @@ class SearchResultItem(BaseModel):
     page_start: int
     page_end: int
     pages: List[int]
+    section_title: Optional[str] = None
+    paragraph_range: Optional[str] = None
     distance: float
     similarity_score: float
 
@@ -124,4 +140,23 @@ class SearchResponse(BaseModel):
     query: str
     total_results: int
     results: List[SearchResultItem]
+
+
+class DocumentContentSection(BaseModel):
+    section_index: int
+    section_title: str
+    paragraph_start: Optional[int] = None
+    paragraph_end: Optional[int] = None
+    content: str
+    char_count: int = 0
+
+
+class DocumentContentResponse(BaseModel):
+    document_id: str
+    original_filename: str
+    file_format: str
+    citation_unit: str
+    total_sections: int
+    headings: List[Dict[str, Any]] = []
+    sections: List[DocumentContentSection] = []
 

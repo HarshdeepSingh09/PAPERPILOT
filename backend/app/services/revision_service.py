@@ -56,8 +56,12 @@ class RevisionService:
             cleaned = cleaned[:-3]
         return cleaned.strip()
 
-    def get_saved_notes(self, document_id: str, db: Session) -> Optional[RevisionNotesResponse]:
-        """Retrieves existing saved revision notes from SQLite."""
+    def get_saved_notes(self, document_id: str, db: Session, user_id: Optional[str] = None) -> Optional[RevisionNotesResponse]:
+        """Retrieves existing saved revision notes from SQLite after verifying ownership."""
+        if user_id is not None:
+            doc = db.query(Document).filter(Document.id == document_id, Document.user_id == user_id).first()
+            if not doc:
+                return None
         record = db.query(RevisionNote).filter(RevisionNote.document_id == document_id).first()
         if not record:
             return None
@@ -113,18 +117,23 @@ class RevisionService:
         self,
         document_id: str,
         db: Session,
-        force_regenerate: bool = False
+        force_regenerate: bool = False,
+        user_id: Optional[str] = None,
     ) -> RevisionNotesResponse:
         """
-        Retrieves existing revision notes from SQLite or generates fresh notes using Gemini.
+        Retrieves existing revision notes from SQLite or generates fresh notes using Gemini,
+        strictly enforcing document ownership.
         """
-        doc = db.query(Document).filter(Document.id == document_id).first()
+        q = db.query(Document).filter(Document.id == document_id)
+        if user_id is not None:
+            q = q.filter(Document.user_id == user_id)
+        doc = q.first()
         if not doc:
             raise ValueError(f"Document with ID '{document_id}' not found.")
 
         # 1. Check if saved notes already exist in SQLite
         if not force_regenerate:
-            existing = self.get_saved_notes(document_id, db)
+            existing = self.get_saved_notes(document_id, db, user_id=doc.user_id)
             if existing:
                 logger.info(f"Loaded existing revision notes from SQLite for document '{document_id}'")
                 return existing
@@ -199,6 +208,7 @@ class RevisionService:
         existing_record = db.query(RevisionNote).filter(RevisionNote.document_id == document_id).first()
 
         if existing_record:
+            existing_record.user_id = doc.user_id
             existing_record.title = f"Revision Notes: {doc_title}"
             existing_record.chapter_overview = notes_data.get("chapter_overview", "")
             existing_record.definitions_json = json.dumps(notes_data.get("definitions", []))
@@ -216,6 +226,7 @@ class RevisionService:
             new_record = RevisionNote(
                 id=note_id,
                 document_id=document_id,
+                user_id=doc.user_id,
                 title=f"Revision Notes: {doc_title}",
                 chapter_overview=notes_data.get("chapter_overview", ""),
                 definitions_json=json.dumps(notes_data.get("definitions", [])),

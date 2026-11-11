@@ -7,14 +7,16 @@ from typing import List, Dict, Any, Optional
 
 @dataclass
 class SentenceUnit:
-    """Represents a discrete sentence or text block associated with its source page."""
+    """Represents a discrete sentence or text block associated with its source page or section."""
     text: str
     page: int
+    section_title: Optional[str] = None
+    paragraph_range: Optional[str] = None
 
 
 @dataclass
 class TextChunk:
-    """Represents a bounded, overlapping chunk of text with complete page-range metadata."""
+    """Represents a bounded, overlapping chunk of text with complete page/section range metadata."""
     id: str
     document_id: str
     chunk_index: int
@@ -23,6 +25,8 @@ class TextChunk:
     page_start: int
     page_end: int
     pages: List[int]
+    section_title: Optional[str] = None
+    paragraph_range: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -34,6 +38,8 @@ class TextChunk:
             "page_start": self.page_start,
             "page_end": self.page_end,
             "pages": self.pages,
+            "section_title": self.section_title,
+            "paragraph_range": self.paragraph_range,
         }
 
 
@@ -60,6 +66,10 @@ class IntelligentChunker:
 
         for page_item in pages_data:
             page_num = page_item.get("page", 1)
+            section_title = page_item.get("section_title")
+            p_start = page_item.get("paragraph_start")
+            p_end = page_item.get("paragraph_end")
+            para_range = f"{p_start}-{p_end}" if p_start is not None and p_end is not None else None
             raw_text = page_item.get("text", "").strip()
             if not raw_text:
                 continue
@@ -81,9 +91,19 @@ class IntelligentChunker:
                         sub_parts = self._split_long_sentence(sent, max_len=self.chunk_size)
                         for part in sub_parts:
                             if part.strip():
-                                units.append(SentenceUnit(text=part.strip(), page=page_num))
+                                units.append(SentenceUnit(
+                                    text=part.strip(),
+                                    page=page_num,
+                                    section_title=section_title,
+                                    paragraph_range=para_range,
+                                ))
                     else:
-                        units.append(SentenceUnit(text=sent, page=page_num))
+                        units.append(SentenceUnit(
+                            text=sent,
+                            page=page_num,
+                            section_title=section_title,
+                            paragraph_range=para_range,
+                        ))
 
         return units
 
@@ -163,6 +183,10 @@ class IntelligentChunker:
             contributing_pages = sorted(list(set(u.page for u in current_units)))
             page_start = contributing_pages[0]
             page_end = contributing_pages[-1]
+            sec_titles = [u.section_title for u in current_units if u.section_title]
+            primary_section = sec_titles[0] if sec_titles else None
+            para_ranges = [u.paragraph_range for u in current_units if u.paragraph_range]
+            primary_para_range = para_ranges[0] if para_ranges else None
 
             chunk_id = str(uuid.uuid4())
             chunks.append(
@@ -175,6 +199,8 @@ class IntelligentChunker:
                     page_start=page_start,
                     page_end=page_end,
                     pages=contributing_pages,
+                    section_title=primary_section,
+                    paragraph_range=primary_para_range,
                 )
             )
             chunk_index += 1

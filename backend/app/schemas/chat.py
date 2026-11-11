@@ -4,9 +4,12 @@ from pydantic import BaseModel, Field
 
 
 class Citation(BaseModel):
-    page: int = Field(..., description="1-indexed PDF page number")
-    snippet: Optional[str] = Field(None, description="Concise text snippet from the cited page")
+    page: int = Field(..., description="1-indexed PDF page number or DOCX/TXT section number")
+    snippet: Optional[str] = Field(None, description="Concise text snippet from the cited location")
     chunk_index: Optional[int] = Field(None, description="Source chunk index")
+    label: Optional[str] = Field(None, description="Human-readable citation label (e.g. Page 6 or Section 2)")
+    source_type: Optional[str] = Field(None, description="'page' for PDF or 'section' for DOCX/TXT")
+    section_title: Optional[str] = Field(None, description="Section heading for DOCX/TXT citations")
 
 
 class DocumentChatRequest(BaseModel):

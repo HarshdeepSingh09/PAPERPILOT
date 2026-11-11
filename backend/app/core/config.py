@@ -38,12 +38,29 @@ class Settings(BaseSettings):
     # Storage Paths
     UPLOAD_DIR: str = os.path.join(BASE_BACKEND_DIR, "storage", "uploads")
     CHROMA_PERSIST_DIR: str = os.path.join(BASE_BACKEND_DIR, "storage", "chroma_db")
+    MAX_UPLOAD_SIZE_MB: int = 25
 
     @field_validator("UPLOAD_DIR", "CHROMA_PERSIST_DIR", mode="after")
     def resolve_storage_paths(cls, v: str) -> str:
         if not os.path.isabs(v):
             return os.path.abspath(os.path.join(BASE_BACKEND_DIR, v))
         return os.path.abspath(v)
+
+    # Authentication & Session Configuration
+    SESSION_COOKIE_NAME: str = "paperpilot_session"
+    SESSION_EXPIRE_HOURS: int = 168  # 7 days
+    SESSION_COOKIE_SAMESITE: str = "lax"
+    SESSION_COOKIE_SECURE: bool = False  # Set True in HTTPS production deployments
+    PASSWORD_RESET_EXPIRE_MINUTES: int = 30
+    FRONTEND_APP_URL: str = "http://localhost:5173"
+
+    # Optional SMTP Email Configuration (for password reset emails)
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 587
+    SMTP_USER: str = ""
+    SMTP_PASSWORD: str = ""
+    SMTP_FROM_EMAIL: str = ""
+    SMTP_USE_TLS: bool = True
 
     # AI Configuration
     GEMINI_API_KEY: str = ""

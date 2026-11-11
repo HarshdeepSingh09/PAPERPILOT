@@ -126,11 +126,11 @@ class RAGService:
 
     def extract_target_page(self, query: str) -> Optional[int]:
         """
-        Extracts explicit page number reference from a query if present.
-        Matches patterns like 'page 6', 'page #6', 'p. 6', 'p.6', 'on page 6', etc.
+        Extracts explicit page or section number reference from a query if present.
+        Matches patterns like 'page 6', 'page #6', 'p. 6', 'p.6', 'section 2', etc.
         """
         ql = query.lower().strip()
-        m = re.search(r'\b(?:page|p\.?)\s*(?:no\.?|number|#)?\s*(\d+)\b', ql)
+        m = re.search(r'\b(?:page|p\.?|section)\s*(?:no\.?|number|#)?\s*(\d+)\b', ql)
         if m:
             return int(m.group(1))
         return None
@@ -269,9 +269,9 @@ class RAGService:
         # 1. Document metadata patterns
         if re.search(r'\b(chapter\s*(name|title|number)|name\s*of\s*(the|this)\s*chapter|what\s*chapter|which\s*chapter)\b', ql):
             return "document_meta"
-        if re.search(r'\b(document\s*(name|title)|title\s*of\s*(the|this)\s*(document|book|pdf|chapter)|book\s*title)\b', ql):
+        if re.search(r'\b(document\s*(name|title|type|category)|title\s*of\s*(the|this)\s*(document|book|pdf|file|report|paper)|book\s*title)\b', ql):
             return "document_meta"
-        if re.search(r'\b(how\s*many\s*pages|page\s*count|number\s*of\s*pages|total\s*pages)\b', ql):
+        if re.search(r'\b(how\s*many\s*(pages|sections)|page\s*count|section\s*count|number\s*of\s*(pages|sections)|total\s*(pages|sections))\b', ql):
             return "document_meta"
         if re.search(r'\b(who\s*(wrote|authored|is\s*the\s*author)|author\s*of)\b', ql):
             return "document_meta"
@@ -308,13 +308,24 @@ class RAGService:
 
         return "content_specific"
 
+    @staticmethod
+    def _get_authorized_doc(document_id: str, db: Session, user_id: Optional[str] = None) -> Document:
+        q = db.query(Document).filter(Document.id == document_id)
+        if user_id is not None:
+            q = q.filter(Document.user_id == user_id)
+        doc = q.first()
+        if not doc:
+            raise DocumentNotFoundError(f"Document with ID '{document_id}' not found.")
+        return doc
+
     def retrieve_context(
         self,
         document_id: str,
         query: str,
         top_k: int = DEFAULT_TOP_K,
         db: Optional[Session] = None,
-        intent: str = "content_specific"
+        intent: str = "content_specific",
+        user_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         Retrieves context chunks tailored to the classified intent:
@@ -322,10 +333,11 @@ class RAGService:
         - 'broad_summary': Combines opening chunks, concluding summary chunks, and top semantic chunks.
         - 'content_specific': Targeted ChromaDB vector similarity search.
         """
+        doc = None
+        effective_uid = user_id
         if db is not None:
-            doc = db.query(Document).filter(Document.id == document_id).first()
-            if not doc:
-                raise DocumentNotFoundError(f"Document with ID '{document_id}' not found.")
+            doc = self._get_authorized_doc(document_id, db, user_id=user_id)
+            effective_uid = doc.user_id
             if doc.status == "ocr_required":
                 raise DocumentNotReadyError(
                     "This document contains scanned images without extractable text. OCR is not yet supported."
@@ -338,7 +350,7 @@ class RAGService:
                 )
 
             # Check if vectors are indexed in ChromaDB
-            vector_count = self.vector_store.get_document_vector_count(document_id)
+            vector_count = self.vector_store.get_document_vector_count(document_id, user_id=effective_uid)
             if vector_count == 0 and doc.total_chunks > 0:
                 embedded_count = (
                     db.query(DocumentChunk)
@@ -347,7 +359,7 @@ class RAGService:
                 )
                 if embedded_count == doc.total_chunks:
                     logger.info(f"Auto-indexing {embedded_count} embedded chunks for document '{document_id}' into ChromaDB...")
-                    self.vector_store.index_document_chunks(document_id=document_id, db=db, force=False)
+                    self.vector_store.index_document_chunks(document_id=document_id, db=db, force=False, user_id=effective_uid)
                 else:
                     raise DocumentNotReadyError(
                         f"Document '{document_id}' has not been embedded yet. "
@@ -372,6 +384,8 @@ class RAGService:
                         "pages": c.pages,
                         "page_start": c.page_start,
                         "page_end": c.page_end,
+                        "section_title": getattr(c, "section_title", None),
+                        "paragraph_range": getattr(c, "paragraph_range", None),
                         "similarity_score": 1.0,
                         "distance": 0.0
                     }
@@ -411,7 +425,8 @@ class RAGService:
                     document_id=document_id,
                     query=query,
                     top_k=4,
-                    db=db
+                    db=db,
+                    user_id=effective_uid,
                 )
             except Exception:
                 semantic = []
@@ -468,7 +483,7 @@ class RAGService:
                 )
                 if page_ctx:
                     return page_ctx
-            exercise_context = self.retrieve_exercise_context(document_id, query, db)
+            exercise_context = self.retrieve_exercise_context(document_id, query, db, user_id=effective_uid)
             if exercise_context:
                 return exercise_context
 
@@ -478,7 +493,8 @@ class RAGService:
                 document_id=document_id,
                 query=query,
                 top_k=top_k,
-                db=db
+                db=db,
+                user_id=effective_uid,
             )
         except DocumentNotIndexedError as e:
             raise DocumentNotReadyError(str(e)) from e
@@ -511,9 +527,10 @@ class RAGService:
             if target_page in c.pages or (c.page_start <= target_page <= c.page_end)
         ]
 
-        # Extract contiguous text for the page
+        # Extract contiguous text for the page (PDF only; DOCX/TXT read directly from chunks)
         page_raw_text = None
-        if doc and doc.file_path and os.path.exists(doc.file_path):
+        doc_fmt = (getattr(doc, "file_format", None) or "pdf").lower() if doc else "pdf"
+        if doc and doc_fmt == "pdf" and doc.file_path and os.path.exists(doc.file_path):
             try:
                 import pymupdf
                 pdf = pymupdf.open(doc.file_path)
@@ -681,7 +698,8 @@ class RAGService:
         self,
         document_id: str,
         query: str,
-        db: Session
+        db: Session,
+        user_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         Locates the exact exercise / in-text question and retrieves supporting chapter theory.
@@ -779,7 +797,8 @@ class RAGService:
                         document_id=document_id,
                         query=clean_query,
                         top_k=3,
-                        db=db
+                        db=db,
+                        user_id=user_id,
                     )
                 except Exception:
                     supporting = []
@@ -856,17 +875,22 @@ class RAGService:
         context_chunks: List[Dict[str, Any]],
         conversation_history: List[Dict[str, str]],
         doc_metadata: Optional[Dict[str, Any]] = None,
-        intent: str = "content_specific"
+        intent: str = "content_specific",
+        document_category: str = "Educational Material",
+        file_format: str = "pdf",
     ) -> str:
         """
-        Assembles strict grounding instructions, document metadata, excerpts with page labels,
-        conversation memory, and user question.
+        Assembles strict grounding instructions, document metadata, excerpts with page or section labels,
+        conversation memory, and user question adapted to document category and file format.
         """
+        is_pdf = (file_format or "pdf").lower() == "pdf"
         meta_section = ""
         if doc_metadata:
             meta_lines = []
             if doc_metadata.get("title"):
                 meta_lines.append(f"Document Title: {doc_metadata['title']}")
+            if document_category:
+                meta_lines.append(f"Document Category: {document_category}")
             if doc_metadata.get("chapter_name"):
                 meta_lines.append(f"Chapter Name: {doc_metadata['chapter_name']}")
             if doc_metadata.get("chapter_number"):
@@ -874,7 +898,8 @@ class RAGService:
             if doc_metadata.get("subject"):
                 meta_lines.append(f"Subject: {doc_metadata['subject']}")
             if doc_metadata.get("total_pages"):
-                meta_lines.append(f"Total Pages: {doc_metadata['total_pages']}")
+                unit_label = "Total Pages" if is_pdf else "Total Sections"
+                meta_lines.append(f"{unit_label}: {doc_metadata['total_pages']}")
             if doc_metadata.get("author"):
                 meta_lines.append(f"Author: {doc_metadata['author']}")
 
@@ -886,8 +911,18 @@ class RAGService:
             pages_list = c.get("pages", [c.get("page_start", 1)])
             pages_str = ", ".join(map(str, pages_list)) if pages_list else str(c.get("page_start", 1))
             score = c.get("similarity_score", 0.0)
+            if is_pdf:
+                loc_label = f"Pages: {pages_str}"
+            else:
+                sec_title = c.get("section_title")
+                para_range = c.get("paragraph_range")
+                loc_label = f"Section: {pages_str}"
+                if sec_title and not str(sec_title).lower().startswith("section "):
+                    loc_label += f" ({sec_title})"
+                if para_range:
+                    loc_label += f", Paragraphs: {para_range}"
             excerpts_str += (
-                f"\n--- [EXCERPT {i+1}] (Pages: {pages_str} | Similarity Score: {score:.3f}) ---\n"
+                f"\n--- [EXCERPT {i+1}] ({loc_label} | Similarity Score: {score:.3f}) ---\n"
                 f"{c.get('content', '').strip()}\n"
             )
 
@@ -899,44 +934,79 @@ class RAGService:
                 history_str += f"{role_label}: {h['content']}\n"
             history_str += "===================================\n"
 
+        citation_instruction = (
+            "7. Citations: Always cite the specific page numbers where relevant information is found (e.g. 'According to page 14...')."
+            if is_pdf
+            else "7. Citations: Cite the specific section and/or paragraph references where information is found (e.g. 'According to Section 2...'). Do NOT invent PDF page numbers."
+        )
+
+        category_guidance_map = {
+            "Research Paper": (
+                "You are PaperPilot, an academic research analysis assistant.\n"
+                "Focus on research objectives, methodology, datasets, quantitative results, limitations, and contributions strictly stated in the paper."
+            ),
+            "Business Report": (
+                "You are PaperPilot, a business intelligence document analyst.\n"
+                "Focus on insights, strategic findings, action items, and explicitly reported figures. NEVER invent business or financial metrics."
+            ),
+            "Meeting Notes": (
+                "You are PaperPilot, a meeting intelligence assistant.\n"
+                "Focus on decisions, action items, explicit assignees, explicit deadlines, and unresolved issues. NEVER invent assignees or deadlines not written in the notes."
+            ),
+            "Legal Document": (
+                "You are PaperPilot, an informational legal document analysis assistant.\n"
+                "Summarize clauses, party obligations, dates, and conditions factually. Clarify that your explanation is informational and not legal advice. NEVER fabricate legal obligations."
+            ),
+            "Financial Report": (
+                "You are PaperPilot, a financial document analyst.\n"
+                "Report exact figures, revenue/expense line items, trends, and explicitly supported ratios. NEVER fabricate missing financial numbers or calculate unsupported ratios."
+            ),
+            "User Manual / Technical Documentation": (
+                "You are PaperPilot, a technical documentation assistant.\n"
+                "Provide exact step-by-step instructions, commands, troubleshooting fixes, and safety/operational warnings from the manual."
+            ),
+            "General Document": (
+                "You are PaperPilot, an intelligent document analysis assistant.\n"
+                "Answer clearly, concisely, and strictly based on the provided document metadata and excerpts."
+            ),
+        }
+
+        if document_category == "Educational Material":
+            role_header = (
+                "You are PaperPilot, an intelligent, educational document analysis assistant and expert tutor.\n"
+                "Your task is to answer the user's question clearly, thoroughly, and strictly based on the verified Document Metadata and Document Excerpts provided below.\n\n"
+            )
+            extra_rules = (
+                "3. Exercise & Practice Questions:\n"
+                "   - When answering a question from exercises or in-text questions:\n"
+                "     * State the question number and page reference clearly.\n"
+                "     * If multiple choice: identify the correct option clearly and explain why it is correct and why other options are wrong.\n"
+                "     * For numericals or equation balancing: provide Given data/equation, Step-by-step balancing or calculation, and the Final balanced equation/result with units.\n"
+                "     * For theoretical questions: give a direct, clear answer followed by educational explanation citing relevant concepts.\n"
+                "8. Page-Specific Questions & Activities:\n"
+                "   - When answering multiple questions on a page, answer EVERY identified question in original order using '**Question N:** ...' and '**Answer:** ...'. Never invent extra questions.\n"
+            )
+        else:
+            role_header = (
+                f"{category_guidance_map.get(document_category, category_guidance_map['General Document'])}\n"
+                "Your task is to answer the user's question clearly, accurately, and strictly based on the verified Document Metadata and Document Excerpts provided below.\n\n"
+            )
+            extra_rules = (
+                "3. Clarity & Accuracy: Structure findings cleanly using bullet points or concise paragraphs grounded strictly in the excerpts.\n"
+            )
+
         prompt = (
-            "You are PaperPilot, an intelligent, educational document analysis assistant and expert tutor.\n"
-            "Your task is to answer the user's question clearly, thoroughly, and strictly based on the verified Document Metadata and Document Excerpts provided below.\n\n"
+            f"{role_header}"
             "CRITICAL OPERATIONAL RULES:\n"
-            "1. Grounding: Answer strictly using facts, reactions, formulas, and definitions from the metadata and excerpts. Do not fabricate or extrapolate information.\n"
-            "2. Document Metadata: For questions regarding chapter name, title, author, or page count, state the exact details from the verified metadata and opening page.\n"
-            "3. Exercise & Practice Questions:\n"
-            "   - When answering a question from exercises or in-text questions:\n"
-            "     * State the question number and page reference clearly.\n"
-            "     * If multiple choice: identify the correct option clearly (e.g. '**Correct Option:** (i) Statements (a) and (b) are incorrect') and explain why it is correct and why other options are wrong.\n"
-            "     * For numericals or equation balancing: provide Given data/equation, Step-by-step balancing or calculation, and the Final balanced equation/result with units.\n"
-            "     * For theoretical questions: give a direct, clear answer followed by educational explanation citing relevant concepts.\n"
+            "1. Grounding: Answer strictly using facts, concepts, figures, and clauses from the metadata and excerpts. Do not fabricate or extrapolate information.\n"
+            "2. Document Metadata: For questions regarding title, category, author, or page/section count, state the exact details from the verified metadata and opening content.\n"
+            f"{extra_rules}"
             "4. Mathematical & Chemical Formatting:\n"
-            "   - Always format all chemical equations, reaction mechanisms, formulas, and mathematical expressions using clean LaTeX / KaTeX syntax:\n"
-            "     * Use inline math '$ ... $' for expressions inside sentences (e.g. '$\\text{Zn} + \\text{H}_2\\text{SO}_4 \\rightarrow \\text{ZnSO}_4 + \\text{H}_2$', '$\\text{pH} < 7$').\n"
-            "     * Use block math '$$ ... $$' on its own line for standalone equations.\n"
-            "     * Use proper chemical notation with subscripts '_' (e.g. '$\\text{H}_2\\text{O}$', '$\\text{Fe}_2\\text{O}_3$'), state symbols '(s)', '(l)', '(g)', '(aq)', and reaction arrows '\\rightarrow'.\n"
-            "     * Use fractions '$\\frac{a}{b}$' and superscripts '^' where appropriate.\n"
-            "   - Ensure every equation is complete and properly closed. Never truncate equations.\n"
-            "5. Quality & Tone: Deliver beginner-friendly, structured, and educational responses. Avoid repetitive phrasing or dumping unedited large paragraphs.\n"
+            "   - Format equations, formulas, and expressions with clean LaTeX / KaTeX syntax ('$ ... $' inline, '$$ ... $$' block) when equations appear.\n"
+            "5. Quality & Tone: Deliver clear, structured, well-organized responses. Avoid repetitive phrasing.\n"
             "6. Fallback Rule: If the excerpts and metadata do not contain sufficient information to answer the question, you MUST explicitly state:\n"
             "   'I cannot find the answer to this question in the provided document.'\n"
-            "7. Citations: Always cite the specific page numbers where relevant information and questions are found (e.g. 'According to page 14...').\n"
-            "8. Page-Specific Questions & Activities:\n"
-            "   - When answering multiple questions on a page (e.g. 'Answer the 3 questions provided on page 6'):\n"
-            "     * Answer EVERY identified question in original order using the exact format:\n"
-            "       **Question 1:** [Actual question text]\n\n"
-            "       **Answer:** [Clear explanation citing supporting pages and concepts, including balanced equations with KaTeX if applicable]\n\n"
-            "       **Question 2:** [Actual question text]\n\n"
-            "       **Answer:** [Clear explanation citing supporting pages and concepts, including balanced equations with KaTeX if applicable]\n\n"
-            "       **Question 3:** [Actual question text]\n\n"
-            "       **Answer:** [Clear explanation citing supporting pages and concepts, including balanced equations with KaTeX if applicable]\n"
-            "     * If only 2 questions can be identified, answer only 2; if 3 are identified, answer all 3. Never invent extra questions.\n"
-            "     * Do not confuse activity instructions or observations with textbook questions.\n"
-            "   - When asked to 'List all questions on page X':\n"
-            "     * List each identified question clearly in original order with its sub-parts (i, ii, iii). State the page number.\n"
-            "   - When asked to 'Explain the activity on page X':\n"
-            "     * Provide: Objective/Title, Apparatus & Materials, Procedure, Chemical Equation (in KaTeX), Key Observation (e.g. temperature change), and Conclusion/Reaction Type.\n\n"
+            f"{citation_instruction}\n\n"
             f"{meta_section}"
             f"=== DOCUMENT EXCERPTS ==={excerpts_str}\n"
             "=========================\n"
@@ -1027,11 +1097,12 @@ class RAGService:
         answer: str,
         context_chunks: List[Dict[str, Any]],
         intent: str = "content_specific",
-        doc_metadata: Optional[Dict[str, Any]] = None
+        doc_metadata: Optional[Dict[str, Any]] = None,
+        file_format: str = "pdf",
     ) -> List[Dict[str, Any]]:
         """
-        Constructs clean, deduplicated citation badges with 1-indexed page numbers,
-        chunk indexes, and concise contextual snippets.
+        Constructs clean, deduplicated citation badges with 1-indexed page or section numbers,
+        section headings, chunk indexes, and concise contextual snippets.
         If the answer indicates that information was absent, citations are omitted.
         """
         lower_ans = answer.lower()
@@ -1039,7 +1110,10 @@ class RAGService:
         if any(phrase in lower_ans for phrase in self.FALLBACK_PHRASES):
             return []
 
-        # Deduplicate citations by page number
+        is_pdf = (file_format or "pdf").lower() == "pdf"
+        source_type = "page" if is_pdf else "section"
+
+        # Deduplicate citations by page/section number
         page_to_citation: Dict[int, Dict[str, Any]] = {}
 
         for chunk in context_chunks:
@@ -1048,24 +1122,42 @@ class RAGService:
             snippet = content[:160] + "..." if len(content) > 160 else content
             snippet = snippet.replace("\n", " ").strip()
             chunk_idx = chunk.get("chunk_index")
+            sec_title = chunk.get("section_title")
+            para_range = chunk.get("paragraph_range")
 
             for page in pages:
                 if page not in page_to_citation:
+                    if is_pdf:
+                        label = f"Page {int(page)}"
+                    else:
+                        label = f"Section {int(page)}"
+                        if sec_title and not str(sec_title).lower().startswith("section "):
+                            label = f"Section {int(page)}: {str(sec_title)[:35]}"
+                        elif para_range:
+                            label = f"Section {int(page)} (Para {para_range})"
+
                     page_to_citation[page] = {
                         "page": int(page),
                         "snippet": snippet,
                         "chunk_index": chunk_idx,
+                        "label": label,
+                        "source_type": source_type,
+                        "section_title": sec_title,
                     }
 
-        # For document-level metadata questions (like chapter name/title), ensure Page 1 is cited
+        # For document-level metadata questions, ensure Page/Section 1 is cited
         if intent == "document_meta" and 1 not in page_to_citation and context_chunks:
             c0 = context_chunks[0]
             content = (c0.get("content") or "").strip()
             snippet = content[:160] + "..." if len(content) > 160 else content
+            sec_title = c0.get("section_title")
             page_to_citation[1] = {
                 "page": 1,
                 "snippet": snippet.replace("\n", " ").strip(),
-                "chunk_index": c0.get("chunk_index", 0)
+                "chunk_index": c0.get("chunk_index", 0),
+                "label": "Page 1" if is_pdf else (f"Section 1: {sec_title}" if sec_title else "Section 1"),
+                "source_type": source_type,
+                "section_title": sec_title,
             }
 
         sorted_citations = sorted(page_to_citation.values(), key=lambda c: c["page"])
@@ -1076,10 +1168,11 @@ class RAGService:
         document_id: str,
         query: str,
         db: Session,
-        top_k: int = DEFAULT_TOP_K
+        top_k: int = DEFAULT_TOP_K,
+        user_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Executes end-to-end RAG pipeline with intent routing:
+        Executes end-to-end RAG pipeline with intent routing and strict user ownership enforcement:
         Intent Classification -> Tailored Retrieval -> Context & Metadata Assembly ->
         Grounded Generation -> Citation Extraction -> SQLite Persistence.
         """
@@ -1087,17 +1180,19 @@ class RAGService:
         if not clean_query:
             raise ValueError("Query message cannot be empty.")
 
-        doc = db.query(Document).filter(Document.id == document_id).first()
-        if not doc:
-            raise DocumentNotFoundError(f"Document with ID '{document_id}' not found.")
+        doc = self._get_authorized_doc(document_id, db, user_id=user_id)
 
         # Ensure document metadata is extracted and saved
+        doc_fmt = (getattr(doc, "file_format", None) or "pdf").lower()
+        doc_cat = getattr(doc, "document_category", None) or "General Document"
         doc_metadata = {
             "title": doc.title,
             "chapter_name": doc.chapter_name,
             "chapter_number": doc.chapter_number,
             "subject": doc.subject,
-            "total_pages": doc.total_pages
+            "total_pages": doc.total_pages,
+            "file_format": doc_fmt,
+            "document_category": doc_cat,
         }
 
         # 1. Classify question intent
@@ -1110,7 +1205,8 @@ class RAGService:
             query=clean_query,
             top_k=top_k,
             db=db,
-            intent=intent
+            intent=intent,
+            user_id=doc.user_id,
         )
 
         # 3. Retrieve recent conversation history
@@ -1126,7 +1222,9 @@ class RAGService:
             context_chunks=context_chunks,
             conversation_history=history,
             doc_metadata=doc_metadata,
-            intent=intent
+            intent=intent,
+            document_category=doc_cat,
+            file_format=doc_fmt,
         )
 
         # 5. Generate grounded response from Gemini
@@ -1137,14 +1235,16 @@ class RAGService:
             answer=answer_text,
             context_chunks=context_chunks,
             intent=intent,
-            doc_metadata=doc_metadata
+            doc_metadata=doc_metadata,
+            file_format=doc_fmt,
         )
 
-        # 7. Persist user message and assistant message to SQLite
+        # 7. Persist user message and assistant message to SQLite scoped by owner user_id
         now = datetime.datetime.now(datetime.timezone.utc)
         user_msg = ChatMessage(
             id=str(uuid.uuid4()),
             document_id=document_id,
+            user_id=doc.user_id,
             role="user",
             content=clean_query,
             created_at=now
@@ -1155,6 +1255,7 @@ class RAGService:
         assistant_msg = ChatMessage(
             id=assistant_msg_id,
             document_id=document_id,
+            user_id=doc.user_id,
             role="assistant",
             content=answer_text,
             page_references=json.dumps(citations) if citations else None,
@@ -1172,13 +1273,11 @@ class RAGService:
             "created_at": assistant_msg.created_at,
         }
 
-    def get_history(self, document_id: str, db: Session) -> List[Dict[str, Any]]:
+    def get_history(self, document_id: str, db: Session, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """
-        Retrieves all conversation messages for a document in chronological order.
+        Retrieves all conversation messages for an ownership-verified document in chronological order.
         """
-        doc = db.query(Document).filter(Document.id == document_id).first()
-        if not doc:
-            raise DocumentNotFoundError(f"Document with ID '{document_id}' not found.")
+        doc = self._get_authorized_doc(document_id, db, user_id=user_id)
 
         messages = (
             db.query(ChatMessage)
@@ -1187,26 +1286,39 @@ class RAGService:
             .all()
         )
 
+        doc_fmt = (getattr(doc, "file_format", None) or "pdf").lower()
+        source_type = "page" if doc_fmt == "pdf" else "section"
         result = []
         for m in messages:
+            enriched_cits = []
+            for c in m.citations:
+                item = dict(c)
+                if not item.get("source_type"):
+                    item["source_type"] = source_type
+                if not item.get("label"):
+                    sec = item.get("section_title")
+                    item["label"] = (
+                        f"Page {item['page']}"
+                        if doc_fmt == "pdf"
+                        else (f"Section {item['page']}: {sec}" if sec else f"Section {item['page']}")
+                    )
+                enriched_cits.append(item)
             result.append({
                 "id": m.id,
                 "document_id": m.document_id,
                 "role": m.role,
                 "content": m.content,
-                "citations": m.citations,
-                "page_references": [c["page"] for c in m.citations],
+                "citations": enriched_cits,
+                "page_references": [c["page"] for c in enriched_cits],
                 "created_at": m.created_at,
             })
         return result
 
-    def clear_history(self, document_id: str, db: Session) -> int:
+    def clear_history(self, document_id: str, db: Session, user_id: Optional[str] = None) -> int:
         """
-        Deletes all chat messages for a document.
+        Deletes all chat messages for an ownership-verified document.
         """
-        doc = db.query(Document).filter(Document.id == document_id).first()
-        if not doc:
-            raise DocumentNotFoundError(f"Document with ID '{document_id}' not found.")
+        self._get_authorized_doc(document_id, db, user_id=user_id)
 
         deleted = (
             db.query(ChatMessage)

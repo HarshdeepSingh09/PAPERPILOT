@@ -3,8 +3,28 @@
 @tailwind utilities;
 
 @layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+  }
+
   body {
-    @apply bg-slate-50 text-slate-800 font-sans;
+    @apply bg-slate-50 text-slate-800 dark:bg-slate-950 dark:text-slate-100 font-sans transition-colors duration-200;
+  }
+}
+
+@media print {
+  html,
+  body,
+  #root {
+    height: auto !important;
+    overflow: visible !important;
+    background-color: white !important;
+    color: black !important;
   }
 }
 
@@ -27,6 +47,14 @@
   background: #94a3b8;
 }
 
+.dark ::-webkit-scrollbar-thumb {
+  background: #334155;
+}
+
+.dark ::-webkit-scrollbar-thumb:hover {
+  background: #475569;
+}
+
 /* KaTeX mathematical and chemical equation responsiveness */
 .katex-display {
   overflow-x: auto;
@@ -36,6 +64,28 @@
 }
 
 .katex {
+  position: relative;
   font-size: 1.05em;
   text-rendering: auto;
+  color: inherit;
+}
+
+/* Subtle landing animations respecting reduced motion */
+@keyframes floatSlow {
+  0%, 100% {
+    transform: translateY(0px);
+  }
+  50% {
+    transform: translateY(-6px);
+  }
+}
+
+.animate-float-slow {
+  animation: floatSlow 6s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-float-slow {
+    animation: none;
+  }
 }

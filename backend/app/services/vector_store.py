@@ -97,32 +97,47 @@ class VectorStoreService:
             metadata={"hnsw:space": "cosine"}
         )
 
-    def get_document_vector_count(self, document_id: str) -> int:
+    @staticmethod
+    def _build_where_filter(document_id: Optional[str] = None, user_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        if document_id and user_id:
+            return {"$and": [{"document_id": document_id}, {"user_id": user_id}]}
+        if document_id:
+            return {"document_id": document_id}
+        if user_id:
+            return {"user_id": user_id}
+        return None
+
+    def get_document_vector_count(self, document_id: str, user_id: Optional[str] = None) -> int:
         """
-        Counts how many vectors are indexed in ChromaDB for a specific document_id.
+        Counts how many vectors are indexed in ChromaDB for a specific document_id
+        (and optional user_id for ownership enforcement).
         """
         collection = self.get_or_create_collection()
         try:
-            results = collection.get(where={"document_id": document_id})
+            where_filter = self._build_where_filter(document_id=document_id, user_id=user_id)
+            results = collection.get(where=where_filter)
             ids = results.get("ids", [])
             return len(ids)
         except Exception as e:
             logger.warning(f"Error checking vector count for document '{document_id}': {e}")
             return 0
 
-    def get_indexing_status(self, document_id: str, db: Optional[Session] = None) -> Dict[str, Any]:
+    def get_indexing_status(self, document_id: str, db: Optional[Session] = None, user_id: Optional[str] = None) -> Dict[str, Any]:
         """
         Returns vector indexing status comparing ChromaDB vector count against SQLite chunk count.
         """
-        indexed_count = self.get_document_vector_count(document_id)
-        total_chunks = 0
-
+        effective_uid = user_id
         if db is not None:
-            doc = db.query(Document).filter(Document.id == document_id).first()
+            q = db.query(Document).filter(Document.id == document_id)
+            if user_id is not None:
+                q = q.filter(Document.user_id == user_id)
+            doc = q.first()
             if not doc:
                 raise DocumentNotFoundError(f"Document with ID '{document_id}' not found.")
+            effective_uid = doc.user_id
             total_chunks = db.query(DocumentChunk).filter(DocumentChunk.document_id == document_id).count()
-        else:
+        indexed_count = self.get_document_vector_count(document_id, user_id=effective_uid)
+        if db is None:
             total_chunks = indexed_count
 
         is_indexed = total_chunks > 0 and indexed_count >= total_chunks
@@ -147,15 +162,21 @@ class VectorStoreService:
         document_id: str,
         db: Session,
         force: bool = False,
-        batch_size: int = MAX_BATCH_SIZE
+        batch_size: int = MAX_BATCH_SIZE,
+        user_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Ingests existing embeddings from SQLite for the given document into ChromaDB.
-        Avoids regenerating embeddings and guarantees zero duplicate vectors.
+        Tags every vector with user_id metadata, avoids regenerating embeddings, and guarantees zero duplicate vectors.
         """
-        doc = db.query(Document).filter(Document.id == document_id).first()
+        q = db.query(Document).filter(Document.id == document_id)
+        if user_id is not None:
+            q = q.filter(Document.user_id == user_id)
+        doc = q.first()
         if not doc:
             raise DocumentNotFoundError(f"Document with ID '{document_id}' not found.")
+
+        owner_uid = doc.user_id
 
         chunks = (
             db.query(DocumentChunk)
@@ -175,7 +196,7 @@ class VectorStoreService:
                 "Please generate embeddings via /embed first."
             )
 
-        existing_count = self.get_document_vector_count(document_id)
+        existing_count = self.get_document_vector_count(document_id, user_id=owner_uid)
         total_chunks = len(chunks)
 
         # If already indexed and not force, return early
@@ -193,7 +214,7 @@ class VectorStoreService:
             }
 
         # Clean existing vectors for this document to prevent duplicate or orphaned vectors
-        if existing_count > 0:
+        if self.get_document_vector_count(document_id) > 0:
             self.delete_document_vectors(document_id)
 
         collection = self.get_or_create_collection()
@@ -204,17 +225,22 @@ class VectorStoreService:
             ids = [c.id for c in batch]
             embeddings = [c.embedding for c in batch]
             documents = [c.content for c in batch]
-            metadatas = [
-                {
+            metadatas = []
+            for c in batch:
+                meta = {
                     "document_id": c.document_id,
+                    "user_id": str(owner_uid),
                     "chunk_id": c.id,
                     "chunk_index": c.chunk_index,
                     "page_start": c.page_start,
                     "page_end": c.page_end,
                     "pages": c.pages_json,
                 }
-                for c in batch
-            ]
+                if getattr(c, "section_title", None):
+                    meta["section_title"] = str(c.section_title)[:200]
+                if getattr(c, "paragraph_range", None):
+                    meta["paragraph_range"] = str(c.paragraph_range)
+                metadatas.append(meta)
 
             collection.add(
                 ids=ids,
@@ -223,8 +249,8 @@ class VectorStoreService:
                 metadatas=metadatas,
             )
 
-        new_count = self.get_document_vector_count(document_id)
-        logger.info(f"Indexed {new_count} chunks for document '{document_id}' into ChromaDB.")
+        new_count = self.get_document_vector_count(document_id, user_id=owner_uid)
+        logger.info(f"Indexed {new_count} chunks for document '{document_id}' (user '{owner_uid}') into ChromaDB.")
 
         return {
             "document_id": document_id,
@@ -235,17 +261,18 @@ class VectorStoreService:
             "message": f"Successfully indexed {new_count} vectors into ChromaDB collection '{self.collection_name}'.",
         }
 
-    def delete_document_vectors(self, document_id: str) -> int:
+    def delete_document_vectors(self, document_id: str, user_id: Optional[str] = None) -> int:
         """
-        Deletes all vector embeddings associated with a document_id from ChromaDB.
+        Deletes all vector embeddings associated with a document_id (and optional user_id) from ChromaDB.
         """
         collection = self.get_or_create_collection()
         try:
-            res = collection.get(where={"document_id": document_id})
+            where_filter = self._build_where_filter(document_id=document_id, user_id=user_id)
+            res = collection.get(where=where_filter)
             ids = res.get("ids", [])
             count = len(ids)
             if count > 0:
-                collection.delete(where={"document_id": document_id})
+                collection.delete(where=where_filter)
                 logger.info(f"Deleted {count} ChromaDB vectors for document '{document_id}'.")
             return count
         except Exception as e:
@@ -259,23 +286,29 @@ class VectorStoreService:
         top_k: int = DEFAULT_TOP_K,
         query_embedding: Optional[List[float]] = None,
         db: Optional[Session] = None,
+        user_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Performs semantic similarity search on a document's chunks in ChromaDB.
-        Returns top matching chunks with similarity score, distance, and page citations.
+        Performs ownership-verified semantic similarity search on a document's chunks in ChromaDB.
+        Enforces SQLite ownership and ChromaDB user_id metadata filtering so another user's chunks can never be retrieved.
         """
         clean_query = (query or "").strip()
         if not clean_query:
             raise ValueError("Search query cannot be empty.")
 
-        # Verify document exists in SQLite if db is provided
+        effective_uid = user_id
+        # Verify document exists (and belongs to user_id when provided) in SQLite
         if db is not None:
-            doc = db.query(Document).filter(Document.id == document_id).first()
+            q = db.query(Document).filter(Document.id == document_id)
+            if user_id is not None:
+                q = q.filter(Document.user_id == user_id)
+            doc = q.first()
             if not doc:
                 raise DocumentNotFoundError(f"Document with ID '{document_id}' not found.")
+            effective_uid = doc.user_id
 
-        # Verify document has vectors indexed
-        indexed_count = self.get_document_vector_count(document_id)
+        # Verify document has vectors indexed under this user's isolation scope
+        indexed_count = self.get_document_vector_count(document_id, user_id=effective_uid)
         if indexed_count == 0:
             raise DocumentNotIndexedError(
                 f"Document '{document_id}' has not been indexed in ChromaDB yet. "
@@ -293,10 +326,11 @@ class VectorStoreService:
 
         collection = self.get_or_create_collection()
         n_results = max(1, min(top_k, indexed_count, 50))
+        where_filter = self._build_where_filter(document_id=document_id, user_id=effective_uid)
 
         raw_results = collection.query(
             query_embeddings=[query_vector],
-            where={"document_id": document_id},
+            where=where_filter,
             n_results=n_results,
         )
 
@@ -312,10 +346,12 @@ class VectorStoreService:
             meta = metas[i] if i < len(metas) else {}
             dist = dists[i] if i < len(dists) else 0.0
 
+            # Defense-in-depth post-filter check against metadata leakage
+            if effective_uid is not None and meta.get("user_id") != str(effective_uid):
+                continue
+
             pages = parse_pages_metadata(meta.get("pages", ""))
 
-            # Cosine distance to similarity score: similarity = 1 - distance
-            # Clamped between 0.0 and 1.0
             dist_val = float(dist)
             similarity = round(max(0.0, min(1.0, 1.0 - dist_val)), 6)
 
@@ -326,11 +362,90 @@ class VectorStoreService:
                 "page_start": int(meta.get("page_start", 1)),
                 "page_end": int(meta.get("page_end", 1)),
                 "pages": pages,
+                "section_title": meta.get("section_title"),
+                "paragraph_range": meta.get("paragraph_range"),
                 "distance": round(dist_val, 6),
                 "similarity_score": similarity,
             })
 
         # Sort by similarity score descending (closest first)
+        results.sort(key=lambda r: r["similarity_score"], reverse=True)
+        return results
+
+    def search_user_documents(
+        self,
+        user_id: str,
+        query: str,
+        top_k: int = DEFAULT_TOP_K,
+        document_id: Optional[str] = None,
+        query_embedding: Optional[List[float]] = None,
+        db: Optional[Session] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Workspace-wide or document-scoped semantic search strictly restricted to a single user_id.
+        """
+        if not user_id:
+            raise ValueError("user_id is required for isolated workspace vector search.")
+        if document_id:
+            return self.search_document(
+                document_id=document_id,
+                query=query,
+                top_k=top_k,
+                query_embedding=query_embedding,
+                db=db,
+                user_id=user_id,
+            )
+
+        clean_query = (query or "").strip()
+        if not clean_query:
+            raise ValueError("Search query cannot be empty.")
+
+        collection = self.get_or_create_collection()
+        user_vecs = collection.get(where={"user_id": user_id})
+        total_user_vecs = len(user_vecs.get("ids") or [])
+        if total_user_vecs == 0:
+            return []
+
+        if query_embedding is not None:
+            query_vector = query_embedding
+        else:
+            vectors = embedding_service.generate_embeddings_for_batch([clean_query])
+            if not vectors or not vectors[0]:
+                raise VectorStoreError("Failed to generate query embedding vector.")
+            query_vector = vectors[0]
+
+        n_results = max(1, min(top_k, total_user_vecs, 50))
+        raw_results = collection.query(
+            query_embeddings=[query_vector],
+            where={"user_id": user_id},
+            n_results=n_results,
+        )
+
+        ids = raw_results.get("ids", [[]])[0]
+        docs = raw_results.get("documents", [[]])[0]
+        metas = raw_results.get("metadatas", [[]])[0]
+        dists = raw_results.get("distances", [[]])[0]
+
+        results: List[Dict[str, Any]] = []
+        for i in range(len(ids)):
+            meta = metas[i] if i < len(metas) else {}
+            if meta.get("user_id") != str(user_id):
+                continue
+            dist_val = float(dists[i] if i < len(dists) else 0.0)
+            results.append({
+                "document_id": str(meta.get("document_id", "")),
+                "chunk_id": str(meta.get("chunk_id", ids[i])),
+                "chunk_index": int(meta.get("chunk_index", 0)),
+                "content": docs[i] if i < len(docs) else "",
+                "page_start": int(meta.get("page_start", 1)),
+                "page_end": int(meta.get("page_end", 1)),
+                "pages": parse_pages_metadata(meta.get("pages", "")),
+                "section_title": meta.get("section_title"),
+                "paragraph_range": meta.get("paragraph_range"),
+                "distance": round(dist_val, 6),
+                "similarity_score": round(max(0.0, min(1.0, 1.0 - dist_val)), 6),
+            })
+
         results.sort(key=lambda r: r["similarity_score"], reverse=True)
         return results
 

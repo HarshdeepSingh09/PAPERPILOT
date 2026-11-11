@@ -15,7 +15,7 @@ if BACKEND_DIR not in sys.path:
 
 from fastapi import HTTPException
 from app.db.session import SessionLocal, init_db
-from app.db.models import Document, DocumentChunk
+from app.db.models import Document, DocumentChunk, User, LEGACY_OWNER_USER_ID
 from app.schemas.document import SearchRequest
 from app.api.v1.documents import (
     index_document_vectors,
@@ -60,6 +60,7 @@ class TestChromaVectorStoreService(unittest.TestCase):
         doc_id = str(uuid.uuid4())
         doc = Document(
             id=doc_id,
+            user_id=LEGACY_OWNER_USER_ID,
             filename=f"{doc_id}.pdf",
             original_filename="test_science.pdf",
             file_path=os.path.join(tempfile.gettempdir(), f"{doc_id}.pdf"),
@@ -299,9 +300,11 @@ class TestChromaVectorStoreEndpoints(unittest.TestCase):
 
     def setUp(self):
         self.db = SessionLocal()
+        self.owner = self.db.query(User).filter(User.id == LEGACY_OWNER_USER_ID).first()
         self.doc_id = str(uuid.uuid4())
         self.doc = Document(
             id=self.doc_id,
+            user_id=self.owner.id,
             filename=f"{self.doc_id}.pdf",
             original_filename="api_test_doc.pdf",
             file_path=os.path.join(tempfile.gettempdir(), f"{self.doc_id}.pdf"),
@@ -345,7 +348,7 @@ class TestChromaVectorStoreEndpoints(unittest.TestCase):
 
     # 14. API: GET /index-status
     def test_api_get_index_status(self):
-        resp = get_document_index_status(self.doc_id, db=self.db)
+        resp = get_document_index_status(self.doc_id, current_user=self.owner, db=self.db)
         self.assertEqual(resp.document_id, self.doc_id)
         self.assertEqual(resp.total_chunks, 2)
         self.assertEqual(resp.indexed_vectors, 0)
@@ -354,21 +357,21 @@ class TestChromaVectorStoreEndpoints(unittest.TestCase):
 
     # 15. API: POST /index
     def test_api_post_index(self):
-        resp = index_document_vectors(self.doc_id, force=False, db=self.db)
+        resp = index_document_vectors(self.doc_id, force=False, current_user=self.owner, db=self.db)
         self.assertEqual(resp.document_id, self.doc_id)
         self.assertEqual(resp.indexed_vectors, 2)
         self.assertEqual(resp.total_chunks, 2)
         self.assertEqual(resp.status, "completed")
 
         # Calling again without force returns already_indexed
-        resp2 = index_document_vectors(self.doc_id, force=False, db=self.db)
+        resp2 = index_document_vectors(self.doc_id, force=False, current_user=self.owner, db=self.db)
         self.assertEqual(resp2.status, "already_indexed")
         self.assertEqual(resp2.indexed_vectors, 2)
 
     # 16. API: POST /search
     def test_api_post_search(self):
         # Index chunks first
-        index_document_vectors(self.doc_id, force=False, db=self.db)
+        index_document_vectors(self.doc_id, force=False, current_user=self.owner, db=self.db)
 
         # Mock embedding_service.generate_embeddings_for_batch to run offline in sandbox
         dummy_query_vector = [[0.05 if j % 2 == 0 else -0.05 for j in range(768)]]
@@ -376,6 +379,7 @@ class TestChromaVectorStoreEndpoints(unittest.TestCase):
             resp = search_document_chunks(
                 self.doc_id,
                 SearchRequest(query="chemical reactions", top_k=2),
+                current_user=self.owner,
                 db=self.db
             )
 
@@ -397,6 +401,7 @@ class TestChromaVectorStoreEndpoints(unittest.TestCase):
                 search_document_chunks(
                     self.doc_id,
                     SearchRequest(query="test query", top_k=2),
+                    current_user=self.owner,
                     db=self.db
                 )
             self.assertEqual(ctx.exception.status_code, 400)
@@ -405,11 +410,11 @@ class TestChromaVectorStoreEndpoints(unittest.TestCase):
     # 18. API: Delete Document Purges Chroma Vectors
     def test_api_delete_document_cleans_chroma_vectors(self):
         # Index document
-        index_document_vectors(self.doc_id, force=False, db=self.db)
+        index_document_vectors(self.doc_id, force=False, current_user=self.owner, db=self.db)
         self.assertEqual(vector_store_service.get_document_vector_count(self.doc_id), 2)
 
         # Delete document via API route
-        delete_document(self.doc_id, db=self.db)
+        delete_document(self.doc_id, current_user=self.owner, db=self.db)
 
         # Chroma vector count must now be 0
         self.assertEqual(vector_store_service.get_document_vector_count(self.doc_id), 0)

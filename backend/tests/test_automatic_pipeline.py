@@ -14,7 +14,7 @@ if BACKEND_DIR not in sys.path:
     sys.path.insert(0, BACKEND_DIR)
 
 from app.db.session import SessionLocal, init_db
-from app.db.models import Document, DocumentChunk
+from app.db.models import Document, DocumentChunk, LEGACY_OWNER_USER_ID
 from app.api.v1.documents import (
     process_document_pipeline,
     execute_extraction_and_chunking,
@@ -78,6 +78,7 @@ class TestAutomaticPipeline(unittest.TestCase):
 
         doc = Document(
             id=doc_id,
+            user_id=LEGACY_OWNER_USER_ID,
             filename=f"{doc_id}.pdf",
             original_filename="science_auto.pdf",
             file_path=pdf_path,
@@ -121,6 +122,7 @@ class TestAutomaticPipeline(unittest.TestCase):
 
         doc = Document(
             id=doc_id,
+            user_id=LEGACY_OWNER_USER_ID,
             filename=f"{doc_id}.pdf",
             original_filename="scanned.pdf",
             file_path=pdf_path,
@@ -144,6 +146,7 @@ class TestAutomaticPipeline(unittest.TestCase):
         doc_id = str(uuid.uuid4())
         doc = Document(
             id=doc_id,
+            user_id=LEGACY_OWNER_USER_ID,
             filename=f"{doc_id}.pdf",
             original_filename="pending.pdf",
             file_path=os.path.join(self.temp_dir.name, "none.pdf"),
@@ -152,10 +155,14 @@ class TestAutomaticPipeline(unittest.TestCase):
         self.db.add(doc)
         self.db.commit()
 
+        owner = self.db.query(
+            __import__("app.db.models", fromlist=["User"]).User
+        ).filter_by(id=LEGACY_OWNER_USER_ID).first()
         with self.assertRaises(HTTPException) as ctx:
             chat_with_document(
                 doc_id,
                 DocumentChatRequest(message="What is this?"),
+                current_user=owner,
                 db=self.db
             )
         self.assertEqual(ctx.exception.status_code, 400)
@@ -173,6 +180,7 @@ class TestAutomaticPipeline(unittest.TestCase):
 
         doc = Document(
             id=doc_id,
+            user_id=LEGACY_OWNER_USER_ID,
             filename=f"{doc_id}.pdf",
             original_filename="reprocess_test.pdf",
             file_path=pdf_path,

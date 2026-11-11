@@ -51,7 +51,7 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
-# Database & Vector Store
+# Database, Vector Store & Local Artifacts
 *.db
 *.sqlite
 *.sqlite3
@@ -59,6 +59,8 @@ backend/storage/uploads/*
 !backend/storage/uploads/.gitkeep
 backend/storage/chroma_db/*
 !backend/storage/chroma_db/.gitkeep
+backend/backups/
+/TEST_*.pdf
 
 # IDEs & OS files
 .vscode/

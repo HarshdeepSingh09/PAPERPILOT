@@ -10,7 +10,7 @@ if BACKEND_DIR not in sys.path:
     sys.path.insert(0, BACKEND_DIR)
 
 from app.db.session import SessionLocal, init_db
-from app.db.models import Document, DocumentChunk, DocumentSummary, Quiz, RevisionNote
+from app.db.models import Document, DocumentChunk, DocumentSummary, Quiz, RevisionNote, LEGACY_OWNER_USER_ID
 from app.services.summary_service import summary_service
 from app.services.quiz_service import quiz_service
 from app.services.revision_service import revision_service
@@ -38,6 +38,7 @@ class TestStudyFeatures(unittest.TestCase):
         # Seed sample document and chunks
         self.test_doc = Document(
             id=self.document_id,
+            user_id=LEGACY_OWNER_USER_ID,
             filename=f"test_{self.document_id[:8]}.pdf",
             original_filename="Test_Science_Chapter.pdf",
             file_path="storage/uploads/test.pdf",

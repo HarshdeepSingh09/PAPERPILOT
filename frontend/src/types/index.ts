@@ -8,6 +8,27 @@ export type DocumentStatus =
   | 'ocr_required'
   | 'failed';
 
+export type DocumentCategory =
+  | 'Educational Material'
+  | 'Research Paper'
+  | 'Business Report'
+  | 'Meeting Notes'
+  | 'Legal Document'
+  | 'Financial Report'
+  | 'User Manual / Technical Documentation'
+  | 'General Document';
+
+export const DOCUMENT_CATEGORIES: DocumentCategory[] = [
+  'Educational Material',
+  'Research Paper',
+  'Business Report',
+  'Meeting Notes',
+  'Legal Document',
+  'Financial Report',
+  'User Manual / Technical Documentation',
+  'General Document',
+];
+
 export interface DocumentItem {
   id: string;
   original_filename: string;
@@ -24,9 +45,45 @@ export interface DocumentItem {
   chapter_name?: string;
   chapter_number?: string;
   subject?: string;
+  file_format?: string;
+  document_category?: DocumentCategory;
+  classification_confidence?: number;
+  classification_source?: string;
+  classification_reason?: string;
+  citation_unit?: 'page' | 'section';
   error_message?: string;
   created_at: string;
   updated_at: string;
+}
+
+export interface DocumentContentSection {
+  section_index: number;
+  section_title: string;
+  paragraph_start?: number;
+  paragraph_end?: number;
+  content: string;
+  char_count: number;
+}
+
+export interface DocumentContentResponse {
+  document_id: string;
+  original_filename: string;
+  file_format: string;
+  citation_unit: 'page' | 'section';
+  total_sections: number;
+  headings: Array<{ level: number; text: string; paragraph_index: number }>;
+  sections: DocumentContentSection[];
+}
+
+export interface AdaptiveInsightsResponse {
+  id?: string;
+  document_id: string;
+  category: DocumentCategory;
+  title: string;
+  generation_source: 'gemini' | 'extractive' | string;
+  insights: Record<string, any>;
+  created_at?: string;
+  updated_at?: string;
 }
 
 export interface DocumentChunkItem {
@@ -55,6 +112,10 @@ export interface DocumentStats {
 export interface Citation {
   page: number;
   snippet?: string;
+  chunk_index?: number;
+  label?: string;
+  source_type?: 'page' | 'section';
+  section_title?: string;
 }
 
 export interface ChatMessage {
@@ -217,3 +278,22 @@ export interface RevisionNotesData {
 }
 
 export type RevisionConcept = KeyConceptItem;
+
+export interface UserProfile {
+  id: string;
+  name: string;
+  email: string;
+  is_active: boolean;
+  created_at: string;
+}
+
+export interface AuthSessionResponse {
+  authenticated: boolean;
+  user: UserProfile;
+  message: string;
+}
+
+export interface ForgotPasswordResponse {
+  message: string;
+  email_delivery_configured: boolean;
+}

@@ -12,7 +12,7 @@ if BACKEND_DIR not in sys.path:
 
 from app.core.config import settings
 from app.db.session import SessionLocal, init_db
-from app.db.models import Document, DocumentChunk
+from app.db.models import Document, DocumentChunk, LEGACY_OWNER_USER_ID
 from app.services.embedding_service import (
     GeminiEmbeddingService,
     MissingAPIKeyError,
@@ -113,6 +113,7 @@ class TestGeminiEmbeddingIntegration(unittest.TestCase):
         # Create a document with 1 normal chunk and 1 empty chunk
         doc = Document(
             id="doc-empty-chunk-test",
+            user_id=LEGACY_OWNER_USER_ID,
             filename="empty_chunk_test.pdf",
             original_filename="Empty Chunk Test.pdf",
             file_path="dummy.pdf",
@@ -172,6 +173,7 @@ class TestGeminiEmbeddingIntegration(unittest.TestCase):
         # Create a test document with 5 chunks across 3 pages
         doc = Document(
             id="doc-embedding-test",
+            user_id=LEGACY_OWNER_USER_ID,
             filename="test_embed.pdf",
             original_filename="Test Embed Document.pdf",
             file_path="dummy_path.pdf",
@@ -245,6 +247,7 @@ class TestGeminiEmbeddingIntegration(unittest.TestCase):
     def test_avoid_unnecessary_regeneration(self):
         doc = Document(
             id="doc-cached-test",
+            user_id=LEGACY_OWNER_USER_ID,
             filename="cached.pdf",
             original_filename="Cached.pdf",
             file_path="dummy.pdf",

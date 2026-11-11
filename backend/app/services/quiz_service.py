@@ -80,8 +80,12 @@ class QuizService:
             completed_at=record.completed_at
         )
 
-    def get_latest_quiz(self, document_id: str, db: Session) -> Optional[QuizResponse]:
-        """Retrieves the most recent quiz attempt for a document."""
+    def get_latest_quiz(self, document_id: str, db: Session, user_id: Optional[str] = None) -> Optional[QuizResponse]:
+        """Retrieves the most recent quiz attempt for an ownership-verified document."""
+        if user_id is not None:
+            doc = db.query(Document).filter(Document.id == document_id, Document.user_id == user_id).first()
+            if not doc:
+                return None
         quiz = (
             db.query(Quiz)
             .filter(Quiz.document_id == document_id)
@@ -92,9 +96,12 @@ class QuizService:
             return None
         return self._record_to_response(quiz, hide_answers=not quiz.completed)
 
-    def get_quiz_by_id(self, quiz_id: str, db: Session) -> Optional[QuizResponse]:
-        """Retrieves quiz by ID."""
-        quiz = db.query(Quiz).filter(Quiz.id == quiz_id).first()
+    def get_quiz_by_id(self, quiz_id: str, db: Session, user_id: Optional[str] = None) -> Optional[QuizResponse]:
+        """Retrieves quiz by ID, enforcing parent document ownership if user_id is provided."""
+        q = db.query(Quiz)
+        if user_id is not None:
+            q = q.join(Document, Quiz.document_id == Document.id).filter(Document.user_id == user_id)
+        quiz = q.filter(Quiz.id == quiz_id).first()
         if not quiz:
             return None
         return self._record_to_response(quiz, hide_answers=not quiz.completed)
@@ -106,12 +113,16 @@ class QuizService:
         difficulty: str = "medium",
         question_type: str = "mixed",
         db: Session = None,
-        force_regenerate: bool = False
+        force_regenerate: bool = False,
+        user_id: Optional[str] = None,
     ) -> QuizResponse:
         """
         Generates interactive assessment questions derived exclusively from the uploaded document.
         """
-        doc = db.query(Document).filter(Document.id == document_id).first()
+        q = db.query(Document).filter(Document.id == document_id)
+        if user_id is not None:
+            q = q.filter(Document.user_id == user_id)
+        doc = q.first()
         if not doc:
             raise ValueError(f"Document with ID '{document_id}' not found.")
 
@@ -217,6 +228,7 @@ class QuizService:
         new_quiz = Quiz(
             id=quiz_id,
             document_id=document_id,
+            user_id=doc.user_id,
             title=f"Quiz: {doc_title}",
             difficulty=difficulty,
             question_count=len(questions_data),
@@ -231,12 +243,21 @@ class QuizService:
 
         return self._record_to_response(new_quiz, hide_answers=True)
 
-    def submit_quiz(self, quiz_id: str, answers: Dict[str, Union[str, List[str]]], db: Session) -> QuizResponse:
+    def submit_quiz(
+        self,
+        quiz_id: str,
+        answers: Dict[str, Union[str, List[str]]],
+        db: Session,
+        user_id: Optional[str] = None,
+    ) -> QuizResponse:
         """
         Evaluates submitted answers, calculates score and percentage, and persists results.
         Reveals correct answers, explanations, and citations for review.
         """
-        quiz = db.query(Quiz).filter(Quiz.id == quiz_id).first()
+        q = db.query(Quiz)
+        if user_id is not None:
+            q = q.join(Document, Quiz.document_id == Document.id).filter(Document.user_id == user_id)
+        quiz = q.filter(Quiz.id == quiz_id).first()
         if not quiz:
             raise ValueError(f"Quiz with ID '{quiz_id}' not found.")
 
